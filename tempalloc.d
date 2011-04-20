@@ -475,10 +475,6 @@ assert(d == [1, 2, 3, 4, 5, 6, 7, 8, 9]);
 */
 CommonType!(staticMap!(ElementType, T))[] stackCat(T...)(T data)
 if(allSatisfy!(isArray, T)) {
-    foreach(array; data) {
-        static assert(is(typeof(array) == typeof(data[0])));
-    }
-
     size_t totalLen = 0;
     foreach(array; data) {
         totalLen += array.length;
@@ -489,19 +485,27 @@ if(allSatisfy!(isArray, T)) {
 
     size_t offset = 0;
     foreach(array; data) {
-        ret[offset..offset + array.length] = array[0..$];
-        offset += array.length;
+        foreach(elem; array) {
+            ret[offset] = elem;
+            offset++;
+        }
     }
     return cast(E[]) ret;
 }
 
 unittest {
+    mixin(newFrame);
     auto a = [1, 2, 3];
     auto b = [4, 5, 6];
     auto c = [7, 8, 9];
 
     auto d = stackCat(a, b, c);
     assert(d == [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+    double[] foo = [1.0, 2, 3];
+    float[] bar = [4f, 5f, 6f];
+    double[] foobar = stackCat(foo, bar);
+    assert(foobar == [1.0, 2, 3, 4, 5, 6]);
 }
 
 /**
