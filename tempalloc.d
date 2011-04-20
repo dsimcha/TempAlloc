@@ -12,7 +12,7 @@ License:    $(WEB boost.org/LICENSE_1_0.txt, Boost License 1.0)
 module core.tempalloc;
 
 import std.traits, core.memory, std.range, core.exception, std.conv,
-    std.algorithm;
+    std.algorithm, std.typetuple;
 
 static import core.stdc.stdlib;
 
@@ -473,7 +473,8 @@ auto d = stackCat(a, b, c);
 assert(d == [1, 2, 3, 4, 5, 6, 7, 8, 9]);
 ---
 */
-T[0] stackCat(T...)(T data) {
+CommonType!(staticMap!(ElementType, T))[] stackCat(T...)(T data)
+if(allSatisfy!(isArray, T)) {
     foreach(array; data) {
         static assert(is(typeof(array) == typeof(data[0])));
     }
@@ -482,14 +483,16 @@ T[0] stackCat(T...)(T data) {
     foreach(array; data) {
         totalLen += array.length;
     }
-    auto ret = newStack!(Unqual!(typeof(T[0][0])))(totalLen);
+
+    alias ElementType!(typeof(return)) E;
+    auto ret = newStack!(Unqual!E)(totalLen);
 
     size_t offset = 0;
     foreach(array; data) {
         ret[offset..offset + array.length] = array[0..$];
         offset += array.length;
     }
-    return cast(T[0]) ret;
+    return cast(E[]) ret;
 }
 
 unittest {
