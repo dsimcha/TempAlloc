@@ -1,125 +1,4 @@
 /**
-This module will eventually be submitted for review and inclusion in
-core.memory.  No synopsis is included since it will likely not be its own
-module.  For now I named it core.tempalloc just to make DDoc generate
-Phobos-style documentation for it.  This is $(B only) a provisional name.
-
-Author:  David Simcha
-Copyright:  Copyright (c) 2008-2011, David Simcha.
-License:    $(WEB boost.org/LICENSE_1_0.txt, Boost License 1.0)
-*/
-
-module core.tempalloc;
-
-import std.traits, core.memory, std.range, core.exception, std.conv,
-    std.algorithm, std.typetuple;
-
-static import core.stdc.stdlib;
-
-// This is just for convenience/code readability/saving typing.
-private enum ptrSize = (void*).sizeof;
-
-// This was accidentally assumed in a few places and I'm too lazy to fix it
-// until I see proof that it needs to be fixed.
-static assert(bool.sizeof == 1);
-
-private template blockAttribute(T) {
-    static if (hasIndirections!(T)) {
-        enum blockAttribute = 0;
-    } else {
-        enum blockAttribute = GC.BlkAttr.NO_SCAN;
-    }
-}
-
-/**
-Returns a new T[] allocated on the garbage collected heap without
-initializing its elements.  This can be a useful optimization if every
-element will be immediately initialized.
-
-Examples:
----
-double[] arr = newVoid!double(100);
-assert(arr.length == 100);
----
-*/
-T[] newVoid(T)(size_t length) {
-    T* ptr = cast(T*) GC.malloc(length * T.sizeof, blockAttribute!(T));
-    return ptr[0..length];
-}
-
-// Memory allocation routines.  These wrap malloc(), free() and realloc(),
-// and guarantee alignment.
-private enum size_t alignBytes = 16;
-
-private  void outOfMemory()  {
-    throw new OutOfMemoryError("Out of memory in TempAlloc.");
-}
-
-/**
-Allocates $(D size) bytes on the C heap, aligned on 16-byte boundaries.
-$(D GC.addRange) is called to allow the block to be scanned
-for pointers by the garbage collector iff $(D shouldAddRange) is true.
-*/
-void* alignedMalloc(size_t size, bool shouldAddRange = false) {
-    // We need (alignBytes - 1) extra bytes to guarantee alignment, 1 byte
-    // to store the shouldAddRange flag, and ptrSize bytes to store
-    // the pointer to the beginning of the block.
-    void* toFree = core.stdc.stdlib.malloc(
-        alignBytes + ptrSize + size
-    );
-
-    if(toFree is null) outOfMemory();
-
-    // Add the offset for the flag and the base pointer.
-    auto intPtr = cast(size_t) toFree + ptrSize + 1;
-
-    // Align it.
-    intPtr = (intPtr + alignBytes - 1) & (~(alignBytes - 1));
-    auto ret = cast(void**) intPtr;
-
-    // Store base pointer.
-    (cast(void**) ret)[-1] = toFree;
-
-    // Store flag.
-    (cast(bool*) ret)[-1 - ptrSize] = shouldAddRange;
-
-    if(shouldAddRange) {
-        GC.addRange(ret, size);
-    }
-
-    return ret;
-}
-
-/**
-Frees memory allocated by $(D alignedMalloc).  $(D ptr) must point to the
-start of the memory block.  If $(D shouldAddRange) was true when
-$(D alignedMalloc) was called, this function also calls $(D GC.removeRange)
-on the block.
-*/
-void alignedFree(void* ptr) {
-    // If it was allocated with alignedMalloc() then the pointer to the
-    // beginning is at ptr[-1].
-    auto addedRange = (cast(bool*) ptr)[-1 - ptrSize];
-
-    if(addedRange) {
-        GC.removeRange(ptr);
-    }
-
-    core.stdc.stdlib.free( (cast(void**) ptr)[-1]);
-}
-
-// This is used by TempAlloc, but I'm not sure enough that its interface
-// isn't going to change to make it public and document it.
-private void* alignedRealloc(void* ptr, size_t newLen, size_t oldLen) {
-    auto storedRange = (cast(bool*) ptr)[-1 - ptrSize];
-    auto newPtr = alignedMalloc(newLen, storedRange);
-    memcpy(newPtr, ptr, oldLen);
-
-    alignedFree(ptr);
-    return newPtr;
-}
-
-/**
 $(D TempAlloc) is a memory allocator based on a thread-local segmented stack.
 A segmented stack is similar to a regular stack in that memory is allocated
 and freed in last in, first out order.  When memory is requested from a
@@ -140,6 +19,17 @@ call stack:
 2.  Since it is a segmented stack, large allocations can be performed with no
     danger of stack overflow errors.
 
+3.  It guarantees 16-byte alignment of all allocated objects.
+
+It has thet following disadvantages:
+
+1.  The extra checks due to stack segmentation make allocation slightly
+    slower and prevent simultanelous deallocation of several objects from
+    being a single decrement of the stack pointer.
+
+2.  Memory allocated on TempAlloc is accessed through an extra layer of
+    pointer indirection compared to memory on the call stack.
+
 It has the following advantages compared to heap allocation:
 
 1.  Both allocation and deallocation are extremely fast.  Most allocations
@@ -155,10 +45,59 @@ It has the following advantages compared to heap allocation:
     $(D TempAlloc) stack, though it can be an issue when trying to allocate
     a new segment.
 
+It has the following disadvantages compared to heap allocation:
+
+1.  The requirement that memory be freed in last in, first out order.
+
+2.  No automatic garbage collection.
+
 Note:
 
 The first segment of the $(D TempAlloc) stack is allocated lazily, so
 no space is allocated in any thread that does not use $(D TempAlloc).
+
+Synopsis:
+---
+// Initialize a new TempAlloc frame.
+TempAlloc.frameInit();
+
+// Allocate a temporary array on the TempAlloc stack.
+auto arr = TempAlloc.newArray!(double[][][])(8, 6, 7);
+assert(arr.length == 8);
+assert(arr[0].length == 6);
+assert(arr[0][0].length == 7);
+
+// Release all memory allocated on TempAlloc since the last call to
+// TempAlloc.frameInit().
+TempAlloc.frameFree();
+---
+
+Author:  David Simcha
+Copyright:  Copyright (c) 2008-2011, David Simcha.
+License:    $(WEB boost.org/LICENSE_1_0.txt, Boost License 1.0)
+*/
+
+module std.tempalloc;
+
+import std.traits, core.memory, std.range, core.exception, std.conv,
+    std.algorithm, std.typetuple;
+
+static import core.stdc.stdlib;
+
+// This is just for convenience/code readability/saving typing.
+private enum ptrSize = (void*).sizeof;
+
+// This was accidentally assumed in a few places and I'm too lazy to fix it
+// until I see proof that it needs to be fixed.
+static assert(bool.sizeof == 1);
+
+// Memory allocation routines.  These wrap malloc(), free() and realloc(),
+// and guarantee alignment.
+private enum size_t alignBytes = 16;
+
+/**
+This struct functions as a namespace for all of the core TempAlloc
+functions.  All of its member functions are static.
 */
 struct TempAlloc {
 private:
@@ -238,12 +177,13 @@ private:
                 alignedFree(toFree.space);
             }
 
+            inUse.destroy();
+
             while(freelist.index > 0) {
                 auto toFree = freelist.pop();
                 alignedFree(toFree);
             }
 
-            inUse.destroy();
             freelist.destroy();
         }
 
@@ -287,9 +227,20 @@ private:
         return stateCopy;
     }
 
+    // CTFE function, for static assertions.  Can't use bsr/bsf b/c it has
+    // to be usable at compile time.
+    static bool isPowerOf2(size_t num) pure {
+        int nBitsSet;
+        foreach(shift; 0..size_t.sizeof * 8) {
+            size_t mask = (cast(size_t) 1) << shift;
+            nBitsSet += ((num & mask) > 0);
+        }
+
+        return nBitsSet == 1;
+    }
+
     static size_t getAligned(size_t nbytes) pure {
-        // Only works if alignBytes is a power of two, but I think that's
-        // a pretty safe assumption.
+        static assert(isPowerOf2(alignBytes));
         return (nbytes + (alignBytes - 1)) & (~(alignBytes - 1));
     }
 
@@ -380,7 +331,7 @@ public:
     to $(D frameInit).
     */
     static void frameInit() {
-        frameInit(getState);
+        frameInit(getState());
     }
 
     /**
@@ -405,7 +356,7 @@ public:
     ---
     */
     static void frameFree() {
-        frameFree(getState);
+        frameFree(getState());
     }
 
     /**
@@ -415,7 +366,55 @@ public:
     for pointers by the garbage collector unless $(D GC.addRange) is called.
     */
     static void* malloc(size_t nbytes) {
-        return malloc(nbytes, getState);
+        return malloc(nbytes, getState());
+    }
+
+    /**Allocates an array of type $(D T) on the $(D TempAlloc) stack.
+    For performance reasons, the returned array is not initialized.  It
+    is not scanned for pointers by the garbage collector unless $(D GC.addRange)
+    is called.   $(D T) may be a multidimensional array.  In this case sizes
+    may be specified for any number of dimensions from 1 to the number in $(D T).
+
+    Examples:
+    ---
+    double[] arr = TempAlloc.newArray!(double[])(100);
+    assert(arr.length == 100);
+
+    double[][] matrix = TempAlloc.newArray!(double[][])(42, 31);
+    assert(matrix.length == 42);
+    assert(matrix[0].length == 31);
+    ---
+    */
+    static auto newArray(T, I...)(I sizes)
+    if(allSatisfy!(isIntegral, I)) {
+        static assert(sizes.length >= 1,
+            "Cannot allocate an array without the size of at least the first " ~
+            " dimension.");
+        static assert(sizes.length <= nDimensions!T,
+            to!string(sizes.length) ~ " dimensions specified for a " ~
+            to!string(nDimensions!T) ~ " dimensional array.");
+
+        alias typeof(T.init[0]) E;
+
+        auto ptr = cast(E*) TempAlloc.malloc(sizes[0] * E.sizeof);
+        auto ret = ptr[0..sizes[0]];
+
+        static if(sizes.length > 1) {
+            foreach(ref elem; ret) {
+                elem = uninitializedArray!(E)(sizes[1..$]);
+            }
+        }
+
+        return ret;
+    }
+
+    unittest {
+        double[] arr = newArray!(double[])(100);
+        assert(arr.length == 100);
+
+        double[][] matrix = newArray!(double[][])(42, 31);
+        assert(matrix.length == 42);
+        assert(matrix[0].length == 31);
     }
 
     /**
@@ -425,38 +424,19 @@ public:
     block being freed.  This bookkeeping is handled internally.
     */
     static void free() {
-        free(getState);
+        free(getState());
     }
 
     /**
     Returns the maximum number of bytes that may be allocated in the
     current stack segment.
     */
-    static size_t slack() @property {
+    static size_t segmentSlack() @property {
         return blockSize - getState().used;
     }
 
 }
 
-/**
-Allocates an array with $(D size) elements of type $(D T) on the $(D TempAlloc)
-stack.  For performance reasons, the returned array is not initialized.  It
-is not scanned for pointers by the garbage collector unless $(D GC.addRange) is
-called.
-
-Examples:
----
-double[] arr = newStack!double(100);
-assert(arr.length == 100);
----
- */
-T[] newStack(T)(size_t size) {
-    auto state = TempAlloc.getState();
-
-    size_t bytes = size * T.sizeof;
-    T* ptr = cast(T*) TempAlloc.malloc(bytes, state);
-    return ptr[0..size];
-}
 
 /**
 Concatenates any number of arrays of the same type, placing results on
@@ -481,7 +461,7 @@ if(allSatisfy!(isArray, T)) {
     }
 
     alias ElementType!(typeof(return)) E;
-    auto ret = newStack!(Unqual!E)(totalLen);
+    auto ret = TempAlloc.newArray!(Unqual!E[])(totalLen);
 
     size_t offset = 0;
     foreach(array; data) {
@@ -516,7 +496,7 @@ under either of the following conditions:
 1.  $(D std.traits.hasIndirections!(ElementType!R)) is false, or
 
 2.  $(D R) is a builtin array.  In this case $(D range) maintains pointers
-    to all elements at least until $(D tempdup) returns, preventing the
+    to all elements at least until $(D tempArray) returns, preventing the
     elements from being freed by the garbage collector.  A similar assumption
     cannot be made for ranges other than builtin arrays.
 
@@ -525,22 +505,28 @@ and $(D GC.addRange) is called.  In either case, $(D TempAlloc.free) or
 $(D TempAlloc.frameFree) will free the array as if it had been allocated on
 the $(D TempAlloc) stack.
 
-Rationale:  The most common reason to call $(D tempdup) on an array is to
+Rationale:  The most common reason to call $(D tempArray) on an array is to
             modify its contents inside a function without affecting the
             caller's view.  In this case $(D range) is not modified and
             prevents the elements from being freed by the garbage
             collector.
+
+Examples:
+---
+auto arr = tempArray(iota(5));
+assert(arr == [0, 1, 2, 3, 4]);
+---
  */
-Unqual!(ElementType!(R))[] tempdup(R)(R range)
+Unqual!(ElementType!(R))[] tempArray(R)(R range)
 if(isInputRange!(R) && (isArray!(R) || !hasIndirections!(ElementType!(R)))) {
     alias ElementType!(R) E;
     alias Unqual!(E) U;
     static if(hasLength!(R)) {
-        U[] ret = newStack!(U)(range.length);
+        U[] ret = TempAlloc.newArray!(U[])(range.length);
         copy(range, ret);
         return ret;
     } else {
-        auto state = TempAlloc.getState;
+        auto state = TempAlloc.getState();
         auto startPtr = TempAlloc.malloc(0);
         size_t bytesCopied = 0;
 
@@ -567,7 +553,7 @@ if(isInputRange!(R) && (isArray!(R) || !hasIndirections!(ElementType!(R)))) {
                     U[] oldData = (cast(U*) startPtr)[0..bytesCopied / U.sizeof];
                     state.used -= bytesCopied;
                     state.totalAllocs--;
-                    U[] newArray = newStack!(U)(bytesCopied / U.sizeof + 1);
+                    U[] newArray = TempAlloc.newArray!(U[])(bytesCopied / U.sizeof + 1);
                     newArray[0..oldData.length] = oldData[];
                     startPtr = state.space;
                     newArray[$ - 1] = elem;
@@ -590,7 +576,7 @@ if(isInputRange!(R) && (isArray!(R) || !hasIndirections!(ElementType!(R)))) {
 }
 
 // Ditto but not worth its own ddoc.
-Unqual!(ElementType!(R))[] tempdup(R)(R range)
+Unqual!(ElementType!(R))[] tempArray(R)(R range)
 if(isInputRange!(R) && !(isArray!(R) || !hasIndirections!(ElementType!(R)))) {
     // Initial guess of how much space to allocate.  It's relatively large b/c
     // the object will be short lived, so speed is more important than space
@@ -602,7 +588,7 @@ if(isInputRange!(R) && !(isArray!(R) || !hasIndirections!(ElementType!(R)))) {
         [0..initialGuess];
 
     finishCopy(arr, range, 0);
-    TempAlloc.getState.putLast(arr.ptr);
+    TempAlloc.getState().putLast(arr.ptr);
     return arr;
 }
 
@@ -627,6 +613,9 @@ private void finishCopy(T, U)(ref T[] result, U range, size_t alreadyCopied) {
 }
 
 unittest {
+    auto arr = tempArray(iota(5));
+    assert(arr == [0, 1, 2, 3, 4]);
+
     // Create quick and dirty finite but lengthless range.
     static struct Count {
         uint num;
@@ -645,15 +634,15 @@ unittest {
     TempAlloc.malloc(1024 * 1024 * 3);
     Count count;
     count.upTo = 1024 * 1025;
-    auto asArray = tempdup(count);
+    auto asArray = tempArray(count);
     foreach(i, elem; asArray) {
         assert(i == elem, to!(string)(i) ~ "\t" ~ to!(string)(elem));
     }
     assert(asArray.length == 1024 * 1025);
     TempAlloc.free;
     TempAlloc.free;
-    while(TempAlloc.getState.freelist.index > 0) {
-        alignedFree(TempAlloc.getState.freelist.pop);
+    while(TempAlloc.getState().freelist.index > 0) {
+        alignedFree(TempAlloc.getState().freelist.pop);
     }
 }
 
@@ -667,12 +656,12 @@ TempAlloc.frameInit();  scope(exit) TempAlloc.frameFree();
 Example:
     ---
 void* useNewFrame() {
-    // This will not be freed when useFrameInit() exits.
+    // This will not be freed when useNewFrame() exits.
     auto ptr1 = TempAlloc.malloc(8);
 
     mixin(newFrame);
 
-    // All of these will be freed when useFrameInit() exits.
+    // All of these will be freed when useNewFrame() exits.
     auto ptr2 = TempAlloc.malloc(3);
     auto ptr3 = TempAlloc.malloc(1);
     auto ptr4 = TempAlloc.malloc(4);
@@ -683,7 +672,7 @@ void* useNewFrame() {
 ---
 */
 immutable string newFrame =
-    "TempAlloc.frameInit; scope(exit) TempAlloc.frameFree;";
+    "TempAlloc.frameInit(); scope(exit) TempAlloc.frameFree();";
 
 unittest {
     /* Not a particularly good unittest in that it depends on knowing the
@@ -700,13 +689,13 @@ unittest {
      foreach(i; 0..nIter) {
          TempAlloc.malloc(alignBytes);
      }
-     assert(TempAlloc.getState.nblocks == 5, to!string(TempAlloc.getState.nblocks));
-     assert(TempAlloc.getState.nfree == 0);
+     assert(TempAlloc.getState().nblocks == 5, to!string(TempAlloc.getState().nblocks));
+     assert(TempAlloc.getState().nfree == 0);
      foreach(i; 0..nIter) {
         TempAlloc.free;
     }
-    assert(TempAlloc.getState.nblocks == 1);
-    assert(TempAlloc.getState.nfree == 2);
+    assert(TempAlloc.getState().nblocks == 1);
+    assert(TempAlloc.getState().nfree == 2);
 
     // Make sure logic for freeing excess blocks works.  If it doesn't this
     // test will run out of memory.
@@ -737,7 +726,7 @@ unittest {
     uint[][] arrays = (cast(uint[]*) GC.malloc((uint[]).sizeof * 10,
                        GC.BlkAttr.NO_SCAN))[0..10];
     foreach(i; 0..10) {
-        uint[] data = newStack!(uint)(250_000);
+        uint[] data = TempAlloc.newArray!(uint[])(250_000);
         foreach(j, ref e; data) {
             e = cast(uint) (j * (i + 1));  // Arbitrary values that can be read back later.
         }
@@ -781,3 +770,61 @@ unittest {
         }
     }
 }
+
+private  void outOfMemory()  {
+    throw new OutOfMemoryError("Out of memory in TempAlloc.");
+}
+
+private void* alignedMalloc(size_t size, bool shouldAddRange = false) {
+    // We need (alignBytes - 1) extra bytes to guarantee alignment, 1 byte
+    // to store the shouldAddRange flag, and ptrSize bytes to store
+    // the pointer to the beginning of the block.
+    void* toFree = core.stdc.stdlib.malloc(
+        alignBytes + ptrSize + size
+    );
+
+    if(toFree is null) outOfMemory();
+
+    // Add the offset for the flag and the base pointer.
+    auto intPtr = cast(size_t) toFree + ptrSize + 1;
+
+    // Align it.
+    intPtr = (intPtr + alignBytes - 1) & (~(alignBytes - 1));
+    auto ret = cast(void**) intPtr;
+
+    // Store base pointer.
+    (cast(void**) ret)[-1] = toFree;
+
+    // Store flag.
+    (cast(bool*) ret)[-1 - ptrSize] = shouldAddRange;
+
+    if(shouldAddRange) {
+        GC.addRange(ret, size);
+    }
+
+    return ret;
+}
+
+private void alignedFree(void* ptr) {
+    // If it was allocated with alignedMalloc() then the pointer to the
+    // beginning is at ptr[-1].
+    auto addedRange = (cast(bool*) ptr)[-1 - ptrSize];
+
+    if(addedRange) {
+        GC.removeRange(ptr);
+    }
+
+    core.stdc.stdlib.free( (cast(void**) ptr)[-1]);
+}
+
+// This is used by TempAlloc, but I'm not sure enough that its interface
+// isn't going to change to make it public and document it.
+private void* alignedRealloc(void* ptr, size_t newLen, size_t oldLen) {
+    auto storedRange = (cast(bool*) ptr)[-1 - ptrSize];
+    auto newPtr = alignedMalloc(newLen, storedRange);
+    memcpy(newPtr, ptr, oldLen);
+
+    alignedFree(ptr);
+    return newPtr;
+}
+void main() {}
