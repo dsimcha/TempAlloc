@@ -13,7 +13,7 @@ call stack:
 
 1.  Pointers to memory allocated on the $(D RegionAllocator) stack are still
     valid when the function they were allocated from returns, unless the
-    last instance of the RegionAllocator object they were allocated from
+    last copy of the $(D RegionAllocator) object they were allocated from
     goes out of scope.  Functions can be written to create and return data
     structures on the $(D RegionAllocator) stack.
 
