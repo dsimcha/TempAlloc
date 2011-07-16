@@ -965,4 +965,3 @@ private void* alignedRealloc(void* ptr, size_t newLen, size_t oldLen) {
     alignedFree(ptr);
     return newPtr;
 }
-void main() {}
