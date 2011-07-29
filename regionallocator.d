@@ -408,6 +408,7 @@ private:
 public:
 
     this(this) {
+        ensureInitialized();
         incrementRefCount();
     }
 
@@ -786,7 +787,9 @@ unittest {
 }
 
 unittest {
-    RegionAllocator alloc;
+    auto alloc = newRegionAllocator();
+    auto alloc2 = alloc;
+
     double[] arr = alloc.uninitializedArray!(double[])(100);
     assert(arr.length == 100);
 
