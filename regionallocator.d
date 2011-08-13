@@ -96,6 +96,24 @@ static assert(bool.sizeof == 1);
 enum size_t defaultSegmentSize = 4 * 1_024 * 1_024;
 
 /**
+This flag determines whether a given $(D RegionAllocatorStack) is scanned for 
+pointers by the garbage collector (GC).  If yes, the entire stack is scanned, 
+not just the part currently in use, since there is currently no efficient way to 
+modify the bounds of a GC region.  The stack is scanned conservatively, meaning 
+that any bit pattern that would point to GC-allocated memory if interpreted as 
+a pointer is considered to be a pointer.  This can result in GC-allocated
+memory being retained when it should be freed.  Due to these caveats,
+it is recommended that any stack scanned by the GC be small and/or short-lived.
+*/
+enum GCScan : bool {
+    ///
+    no = false,
+    
+    ///
+    yes = true
+}
+
+/**
 This object represents a segmented stack.  Memory can be allocated from this
 stack using a $(D RegionAllocator) object.  Multiple 
 $(XREF regionallocator, RegionAllocator) objects may be created per 
@@ -147,21 +165,18 @@ struct RegionAllocatorStack {
 private:
     RefCounted!(RegionAllocatorStackImpl, RefCountedAutoInitialize.no) impl;
     bool initialized;
-
-    void ensureInitialized(size_t segmentSize) {
-        if(initialized) return;
-        enforce(segmentSize > 0, 
-            "Cannot create a RegionAllocatorStack with segment size of 0.");
-        impl = typeof(impl)(segmentSize);
-        initialized = true;
-    }
+    bool _gcScanned;
 
 public:    
     /**
     Create a new $(D RegionAllocatorStack) with a given segment size in bytes.
     */
-    this(size_t segmentSize) {
-        ensureInitialized(segmentSize);
+    this(size_t segmentSize, GCScan shouldScan) {
+        this._gcScanned = shouldScan;
+        enforce(segmentSize > 0, 
+            "Cannot create a RegionAllocatorStack with segment size of 0.");
+        impl = typeof(impl)(segmentSize, shouldScan);
+        initialized = true;
     }
     
     /**
@@ -175,17 +190,17 @@ public:
         ret.ensureInitialized();
         return ret;
     }
+    
+    bool gcScanned() @property const pure nothrow @safe {
+        return _gcScanned;
+    }
 }
 
 private struct RegionAllocatorStackImpl {
    
-    this(size_t segmentSize) {
+    this(size_t segmentSize, GCScan shouldScan) {
         this.segmentSize = segmentSize;
-        initialize();
-    }
-    
-    void initialize() {
-        space = alignedMalloc(segmentSize);
+        space = alignedMalloc(segmentSize, shouldScan);
 
         // We don't need 16-byte alignment for the bookkeeping array.
         immutable nBookKeep = segmentSize / alignBytes;
@@ -288,15 +303,42 @@ size_t threadLocalSegmentSize(size_t newSize) @property @safe {
     return _threadLocalSegmentSize = newSize;
 }
 
+/**
+These properties determine whether the default thread-local 
+$(D RegionAllocatorStack) instance is scanned by the garbage collector.
+The default is no.  In most cases, scanning a stack this long-lived is not
+recommended, as it will cause too many false pointers.  (See $(XREF 
+regionallocator, GCScan) for details.)  
+
+The setter is only effective before the global function
+$(D newRegionAllocator) has been called for the first time in the current
+thread.  Attempts to set this property after the first call to this
+function from the current thread throw an $(D Exception).
+*/
+bool scanThreadLocalStack() @property nothrow @safe {
+    return _scanThreadLocalStack;
+}
+
+/// Ditto
+bool scanThreadLocalStack(bool shouldScan) @property @safe {
+    enforce(!threadLocalInitialized,
+        "Cannot set scanThreadLocalStack after the thread-local " ~
+        "RegionAllocatorStack has been used for the first time.");
+    return _scanThreadLocalStack = shouldScan;
+}
+
 private size_t _threadLocalSegmentSize = defaultSegmentSize;
 private RegionAllocatorStack threadLocalStack;
 private bool threadLocalInitialized;
+private bool _scanThreadLocalStack = false;
 
 // Ensures the thread-local stack is initialized, then returns it.
 private ref RegionAllocatorStack getThreadLocal() {
     if(!threadLocalInitialized) {
         threadLocalInitialized = true;
-        threadLocalStack = RegionAllocatorStack(threadLocalSegmentSize);
+        threadLocalStack = RegionAllocatorStack(
+            threadLocalSegmentSize, cast(GCScan) scanThreadLocalStack
+        );
     }
     
     return threadLocalStack;
@@ -304,7 +346,7 @@ private ref RegionAllocatorStack getThreadLocal() {
 
 static ~this() {
     if(threadLocalInitialized) {
-        clear(threadLocalStack.impl);
+        threadLocalStack.impl.refCountedPayload.destroy();
     }
 }
 
@@ -398,7 +440,7 @@ private:
     
     alias RegionAllocatorStackImpl Impl;  // Save typing.
 
-    ref Impl getStackImpl() {
+    ref Impl getStackImpl()() {
         assert(stack.initialized, 
             "RegionAllocator's stack is not initialized.  Please use " ~
             "newRegionAllocator() to create a RegionAllocator object.");
@@ -439,7 +481,7 @@ private:
         }
     }
 
-    static void* allocate()(size_t nBytes, ref Impl impl) {
+    void* allocate()(size_t nBytes, ref Impl impl) {
         nBytes = allocSize(nBytes);
         with(impl) {
             void* ret;
@@ -447,7 +489,7 @@ private:
                 ret = space + used;
                 used += nBytes;
             } else if (nBytes > segmentSize) {
-                ret = alignedMalloc(nBytes);
+                ret = alignedMalloc(nBytes, gcScanned);
             } else if (nfree > 0) {
                 inUse.push(Block(used, space));
                 space = freelist.pop;
@@ -457,7 +499,7 @@ private:
                 ret = space;
             } else { // Allocate more space.
                 inUse.push(Block(used, space));
-                space = alignedMalloc(segmentSize);
+                space = alignedMalloc(segmentSize, gcScanned);
                 nblocks++;
                 used = nBytes;
                 ret = space;
@@ -506,6 +548,82 @@ private:
             regionInit(*impl);
             correctRegionIndex = impl.regionIndex;
         }
+    }
+    
+    Unqual!(ElementType!(R))[] arrayImplStack(R)(R range) {
+        alias ElementType!(R) E;
+        alias Unqual!(E) U;
+        static if(hasLength!(R)) {
+            U[] ret = uninitializedArray!(U[])(range.length);
+            copy(range, ret);
+            return ret;
+        } else {
+            auto impl = &(getStackImpl());
+            auto startPtr = allocate(0);
+            size_t bytesCopied = 0;
+
+            while(!range.empty) {  // Make sure range interface is being used.
+                auto elem = range.front;
+                if(impl.used + U.sizeof <= segmentSize) {
+                    range.popFront;
+                    *(cast(U*) (startPtr + bytesCopied)) = elem;
+                    bytesCopied += U.sizeof;
+                    impl.used += U.sizeof;
+                } else {
+                    if(bytesCopied + U.sizeof >= segmentSize / 2) {
+                        // Then just heap-allocate.
+                        U[] result = (cast(U*) 
+                            alignedMalloc(bytesCopied * 2, gcScanned))
+                            [0..bytesCopied / U.sizeof * 2];
+
+                        immutable elemsCopied = bytesCopied / U.sizeof;
+                        result[0..elemsCopied] = (cast(U*) startPtr)
+                            [0..elemsCopied];
+                        finishCopy(result, range, elemsCopied);
+                        freeLast();
+                        impl.putLast(result.ptr);
+                        return result;
+                    } else {
+                        U[] oldData = (cast(U*) startPtr)
+                            [0..bytesCopied / U.sizeof];
+                        impl.used -= bytesCopied;
+                        impl.totalAllocs--;
+                        U[] arr = uninitializedArray!(U[])
+                            (bytesCopied / U.sizeof + 1);
+                        arr[0..oldData.length] = oldData[];
+                        startPtr = impl.space;
+                        arr[$ - 1] = elem;
+                        bytesCopied += U.sizeof;
+                        range.popFront;
+                    }
+                }
+            }
+            auto rem = bytesCopied % .alignBytes;
+            if(rem != 0) {
+                auto toAdd = .alignBytes - rem;
+                if(impl.used + toAdd < RegionAllocator.segmentSize) {
+                    impl.used += toAdd;
+                } else {
+                    impl.used = RegionAllocator.segmentSize;
+                }
+            }
+            return (cast(U*) startPtr)[0..bytesCopied / U.sizeof];
+        }
+    }
+
+    Unqual!(ElementType!(R))[] arrayImplHeap(R)(R range) {
+        // Initial guess of how much space to allocate.  It's relatively large b/c
+        // the object will be short lived, so speed is more important than space
+        // efficiency.
+        enum initialGuess = 128;
+
+        alias Unqual!(ElementType!R) E;
+        auto arr = (cast(E*) alignedMalloc(E.sizeof * initialGuess, true))
+            [0..initialGuess];
+
+        finishCopy(arr, range, 0);
+        getStackImpl().putLast(arr.ptr);
+        return arr;
     }
 
 public:
@@ -575,6 +693,14 @@ public:
         void* lastPos = impl.lastAlloc[impl.totalAllocs - 1];
         enforce(ptr is lastPos);
         freeLast();
+    }
+    
+    /**
+    Returns whether the $(D RegionAllocatorStack) used by this
+    $(D RegionAllocator) instance is scanned by the garbage collector.
+    */
+    bool gcScanned() @property const pure nothrow @safe {
+        return stack.gcScanned;
     }
 
     /**Allocates an array of type $(D T)  The returned array is not scanned 
@@ -700,27 +826,31 @@ public:
 
     /**
     Copies $(D range) to an array.  The array will be located on the
-    $(D RegionAllocator) stack and not scanned for pointers by the garbage
-    collector under either of the following conditions:
+    $(D RegionAllocator) stack if any of the following conditions apply:
 
-    1.  $(D std.traits.hasIndirections!(ElementType!R)) is false, or
+    1.  $(D std.traits.hasIndirections!(ElementType!R)) is false.
 
     2.  $(D R) is a builtin array.  In this case $(D range) maintains pointers
         to all elements at least until $(D array) returns, preventing the
-        elements from being freed by the garbage collector.  A similar assumption
-        cannot be made for ranges other than builtin arrays.
+        elements from being freed by the garbage collector.  A similar 
+        assumption cannot be made for ranges other than builtin arrays.
+        
+    3.  The $(D RegionAllocatorStack) instance used by this 
+        $(D RegionAllocator) is scanned by the garbage collector.
 
-    If neither condition is met, the array is returned on the C heap
+    If none of these conditions is met, the array is returned on the C heap
     and $(D GC.addRange) is called.  In either case, $(D RegionAllocator.free),
     $(D RegionAllocator.freeLast), or the last copy of this $(D RegionAllocator)
     instance going out of scope will free the array as if it had been
     allocated on the $(D RegionAllocator) stack.
 
-    Rationale:  The most common reason to call $(D array) on an array is to
-                modify its contents inside a function without affecting the
+    Rationale:  The most common reason to call $(D array) on a builtin array is 
+                to modify its contents inside a function without affecting the
                 caller's view.  In this case $(D range) is not modified and
                 prevents the elements from being freed by the garbage
-                collector.
+                collector.  Furthermore, if the copy returned does need
+                to be scanned, the client can call $(D GC.addRange) before
+                modifying the original array.
 
     Examples:
     ---
@@ -728,84 +858,15 @@ public:
     auto arr = alloc.array(iota(5));
     assert(arr == [0, 1, 2, 3, 4]);
     ---
-     */
-    Unqual!(ElementType!(R))[] array(R)(R range)
-    if(isInputRange!(R) && (isArray!(R) || !hasIndirections!(ElementType!(R)))) {
-        alias ElementType!(R) E;
-        alias Unqual!(E) U;
-        static if(hasLength!(R)) {
-            U[] ret = uninitializedArray!(U[])(range.length);
-            copy(range, ret);
-            return ret;
+    */
+    Unqual!(ElementType!(R))[] array(R)(R range) if(isInputRange!R) {
+        alias Unqual!(ElementType!(R)) E;
+        if(gcScanned || !hasIndirections!E || isArray!R) {
+            return arrayImplStack(range);
         } else {
-            auto impl = &(getStackImpl());
-            auto startPtr = allocate(0);
-            size_t bytesCopied = 0;
-
-            while(!range.empty) {  // Make sure range interface is being used.
-                auto elem = range.front;
-                if(impl.used + U.sizeof <= segmentSize) {
-                    range.popFront;
-                    *(cast(U*) (startPtr + bytesCopied)) = elem;
-                    bytesCopied += U.sizeof;
-                    impl.used += U.sizeof;
-                } else {
-                    if(bytesCopied + U.sizeof >= segmentSize / 2) {
-                        // Then just heap-allocate.
-                        U[] result = (cast(U*) alignedMalloc(bytesCopied * 2))
-                            [0..bytesCopied / U.sizeof * 2];
-
-                        immutable elemsCopied = bytesCopied / U.sizeof;
-                        result[0..elemsCopied] = (cast(U*) startPtr)
-                            [0..elemsCopied];
-                        finishCopy(result, range, elemsCopied);
-                        freeLast();
-                        impl.putLast(result.ptr);
-                        return result;
-                    } else {
-                        U[] oldData = (cast(U*) startPtr)
-                            [0..bytesCopied / U.sizeof];
-                        impl.used -= bytesCopied;
-                        impl.totalAllocs--;
-                        U[] uninitializedArray = uninitializedArray!(U[])
-                            (bytesCopied / U.sizeof + 1);
-                        uninitializedArray[0..oldData.length] = oldData[];
-                        startPtr = impl.space;
-                        uninitializedArray[$ - 1] = elem;
-                        bytesCopied += U.sizeof;
-                        range.popFront;
-                    }
-                }
-            }
-            auto rem = bytesCopied % .alignBytes;
-            if(rem != 0) {
-                auto toAdd = 16 - rem;
-                if(impl.used + toAdd < RegionAllocator.segmentSize) {
-                    impl.used += toAdd;
-                } else {
-                    impl.used = RegionAllocator.segmentSize;
-                }
-            }
-            return (cast(U*) startPtr)[0..bytesCopied / U.sizeof];
+            return arrayImplHeap(range);
         }
-    }
-
-    // Ditto but not worth its own ddoc.
-    Unqual!(ElementType!(R))[] array(R)(R range)
-    if(isInputRange!(R) && !(isArray!(R) || !hasIndirections!(ElementType!(R)))) {
-        // Initial guess of how much space to allocate.  It's relatively large b/c
-        // the object will be short lived, so speed is more important than space
-        // efficiency.
-        enum initialGuess = 128;
-
-        alias Unqual!(ElementType!R) E;
-        auto arr = (cast(E*) alignedMalloc(E.sizeof * initialGuess, true))
-            [0..initialGuess];
-
-        finishCopy(arr, range, 0);
-        getStackImpl().putLast(arr.ptr);
-        return arr;
-    }
+    }    
 }
 
 /**
@@ -1000,7 +1061,7 @@ unittest {
 
 unittest {
     // Make sure the basics of using explicit stacks work.
-    auto stack = RegionAllocatorStack(4 * 1024 * 1024);
+    auto stack = RegionAllocatorStack(4 * 1024 * 1024, GCScan.no);
     auto alloc = stack.newRegionAllocator();
     auto arr = alloc.array(iota(5));
     assert(arr == [0, 1, 2, 3, 4]);
@@ -1015,7 +1076,7 @@ unittest {
     // Make sure the stacks get freed properly when they go out of scope.
     // If they don't then this will run out of memory.
     foreach(i; 0..100_000) {
-        auto stack = RegionAllocatorStack(4 * 1024 * 1024);
+        auto stack = RegionAllocatorStack(4 * 1024 * 1024, GCScan.no);
     }
 }
 
