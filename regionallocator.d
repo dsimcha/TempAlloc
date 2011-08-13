@@ -22,7 +22,7 @@ call stack:
 
 3.  It guarantees 16-byte alignment of all allocated objects.
 
-It has thet following disadvantages:
+It has the following disadvantages:
 
 1.  The extra checks due to stack segmentation make allocation slightly
     slower and prevent simultanelous deallocation of several objects from
@@ -1128,7 +1128,7 @@ static struct SimpleStack(T) {
         }
     }
 }
-void main() {}
+
 private  void outOfMemory()  {
     throw new OutOfMemoryError("Out of memory in RegionAllocator.");
 }
