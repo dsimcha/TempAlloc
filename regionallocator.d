@@ -143,7 +143,7 @@ void main() {
 }
 
 void fun1() {
-    auto stack = RegionAllocatorStack(1_048_576);
+    auto stack = RegionAllocatorStack(1_048_576, GCScan.no);
     fun2(stack);
     
     // At the end of fun1, the last copy of the RegionAllocatorStack
