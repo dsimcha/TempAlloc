@@ -443,7 +443,7 @@ void* thisIsSafe() {
     auto alloc = newRegionAllocator();
     auto ptr1 = alloc.allocate(42);
     
-    auto stack = RegionAllocatorStack(1_048_576);
+    auto stack = RegionAllocatorStack(1_048_576, GCScan.no);
     auto alloc2 = stack.newRegionAllocator();
     
     auto ptr2 = alloc2.allocate(42);
