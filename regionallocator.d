@@ -16,11 +16,13 @@ call stack:
     last instance of the RegionAllocator object they were allocated from
     goes out of scope.  Functions can be written to create and return data
     structures on the $(D RegionAllocator) stack.
+    
+2.  It's possible to have more than one stack per thread.
 
-2.  Since it is a segmented stack, large allocations can be performed with no
+3.  Since it is a segmented stack, large allocations can be performed with no
     danger of stack overflow errors.
 
-3.  It guarantees 16-byte alignment of all allocated objects.
+4.  It guarantees 16-byte alignment of all allocated objects.
 
 It has the following disadvantages:
 
@@ -80,7 +82,7 @@ License:    $(WEB boost.org/LICENSE_1_0.txt, Boost License 1.0)
 */
 
 module std.regionallocator;
-import std.stdio;
+
 import std.traits, core.memory, std.range, core.exception, std.conv,
     std.algorithm, std.typetuple, std.exception, std.typecons;
 
@@ -94,6 +96,17 @@ private enum ptrSize = (void*).sizeof;
 static assert(bool.sizeof == 1);
 
 enum size_t defaultSegmentSize = 4 * 1_024 * 1_024;
+
+/**
+The exception that is thrown on invalid use of $(RegionAllocator) and
+$(D RegionAllocatorStack).  This exception is not thrown on out of memory.
+An $(D OutOfMemoryError) is thrown instead.
+*/
+class RegionAllocatorException : Exception {
+    this(string msg) {
+        super(msg);
+    }
+}
 
 /**
 This flag determines whether a given $(D RegionAllocatorStack) is scanned for 
@@ -115,8 +128,8 @@ enum GCScan : bool {
 
 /**
 This object represents a segmented stack.  Memory can be allocated from this
-stack using a $(D RegionAllocator) object.  Multiple 
-$(XREF regionallocator, RegionAllocator) objects may be created per 
+stack using a $(XREF regionallocator RegionAllocator) object.  Multiple 
+$(D RegionAllocator) objects may be created per 
 $(D RegionAllocatorStack) but each $(D RegionAllocator) uses a single 
 $(D RegionAllocatorStack). 
 
@@ -124,7 +137,7 @@ For most use cases it's convenient to use the default thread-local
 instance of $(D RegionAllocatorStack), which is lazily instantiated on
 the first call to the global function 
 $(XREF regionallocator, newRegionAllocator).  Occasionally it may be useful
-to have multiple independent stacks, in which case a 
+to have multiple independent stacks in one thread, in which case a 
 $(D RegionAllocatorStack) can be created manually.
 
 $(D RegionAllocatorStack) is reference counted and has reference semantics.
@@ -173,8 +186,12 @@ public:
     */
     this(size_t segmentSize, GCScan shouldScan) {
         this._gcScanned = shouldScan;
-        enforce(segmentSize > 0, 
-            "Cannot create a RegionAllocatorStack with segment size of 0.");
+        if(segmentSize == 0) {
+            throw new RegionAllocatorException( 
+                "Cannot create a RegionAllocatorStack with segment size of 0."
+            );
+        }
+        
         impl = typeof(impl)(segmentSize, shouldScan);
         initialized = true;
     }
@@ -183,14 +200,20 @@ public:
     Creates a new $(D RegionAllocator) region using this stack.  
     */    
     RegionAllocator newRegionAllocator() {
-        enforce(initialized,  "Cannot create a RegionAllocator from an " ~
-            "uninitialized RegionAllocatorStack.  Did you call " ~
-            "RegionAllocatorStack's constructor?");
-        auto ret = RegionAllocator(this);
-        ret.ensureInitialized();
-        return ret;
+        if(!initialized) {
+            throw new RegionAllocatorException(
+                "Cannot create a RegionAllocator from an " ~
+                "uninitialized RegionAllocatorStack.  Did you call " ~
+                "RegionAllocatorStack's constructor?"
+            );
+        }
+        
+        return RegionAllocator(this);
     }
     
+    /**
+    Whether this stack is scanned by the garbage collector.
+    */
     bool gcScanned() @property const pure nothrow @safe {
         return _gcScanned;
     }
@@ -206,6 +229,11 @@ private struct RegionAllocatorStackImpl {
         immutable nBookKeep = segmentSize / alignBytes;
         lastAlloc = (cast(void**) core.stdc.stdlib.malloc(nBookKeep))
                     [0..nBookKeep / ptrSize];
+        
+        if(!lastAlloc.ptr) {
+            outOfMemory();
+        }
+        
         nblocks++;
     }
     
@@ -220,7 +248,7 @@ private struct RegionAllocatorStackImpl {
     size_t regionIndex = size_t.max;
 
     // inUse holds info for all blocks except the one currently being
-    // allocated from.  freelist holds space ptrs for all free blocks.
+    // allocated from.  freeList holds space ptrs for all free blocks.
     
     static struct Block {
         size_t used = 0;
@@ -228,20 +256,24 @@ private struct RegionAllocatorStackImpl {
     }
     
     SimpleStack!(Block) inUse;
-    SimpleStack!(void*) freelist;
+    SimpleStack!(void*) freeList;
     
 
     void doubleSize(ref void*[] lastAlloc) {
         size_t newSize = lastAlloc.length * 2;
         void** ptr = cast(void**) core.stdc.stdlib.realloc(
             lastAlloc.ptr, newSize * ptrSize);
+            
+        if(!ptr) {
+            outOfMemory();
+        }
+        
         lastAlloc = ptr[0..newSize];
     }
 
     // Add an element to lastAlloc, checking length first.
     void putLast(void* last) {
-        if (totalAllocs == lastAlloc.length)
-            doubleSize(lastAlloc);
+        if (totalAllocs == lastAlloc.length) doubleSize(lastAlloc);
         lastAlloc[totalAllocs] = cast(void*) last;
         totalAllocs++;
     }
@@ -270,12 +302,12 @@ private struct RegionAllocatorStackImpl {
 
         inUse.destroy();
 
-        while(freelist.index > 0) {
-            auto toFree = freelist.pop();
+        while(freeList.index > 0) {
+            auto toFree = freeList.pop();
             alignedFree(toFree);
         }
 
-        freelist.destroy();
+        freeList.destroy();
     }
 
     ~this() {
@@ -289,7 +321,7 @@ $(D RegionAllocatorStack) instance.  The default size is 4 megabytes.
 The setter is only effective before the global function
 $(D newRegionAllocator) has been called for the first time in the current
 thread.  Attempts to set this property after the first call to this
-function from the current thread throw an $(D Exception).
+function from the current thread throw a $(D RegionAllocatorException).
 */
 size_t threadLocalSegmentSize() @property nothrow @safe {
     return _threadLocalSegmentSize;
@@ -297,9 +329,13 @@ size_t threadLocalSegmentSize() @property nothrow @safe {
 
 /// Ditto
 size_t threadLocalSegmentSize(size_t newSize) @property @safe {
-    enforce(!threadLocalInitialized,
-        "Cannot set threadLocalSegmentSize after the thread-local " ~
-        "RegionAllocatorStack has been used for the first time.");
+    if(threadLocalInitialized) {
+        throw new RegionAllocatorException(
+            "Cannot set threadLocalSegmentSize after the thread-local " ~
+            "RegionAllocatorStack has been used for the first time."
+        );
+    }
+    
     return _threadLocalSegmentSize = newSize;
 }
 
@@ -321,9 +357,13 @@ bool scanThreadLocalStack() @property nothrow @safe {
 
 /// Ditto
 bool scanThreadLocalStack(bool shouldScan) @property @safe {
-    enforce(!threadLocalInitialized,
-        "Cannot set scanThreadLocalStack after the thread-local " ~
-        "RegionAllocatorStack has been used for the first time.");
+    if(threadLocalInitialized) {
+        throw new RegionAllocatorException(
+            "Cannot set scanThreadLocalStack after the thread-local " ~
+            "RegionAllocatorStack has been used for the first time."
+        );
+    }
+    
     return _scanThreadLocalStack = shouldScan;
 }
 
@@ -354,17 +394,21 @@ static ~this() {
 This struct provides an interface to the $(D RegionAllocator) functionality
 and enforces scoped deletion.  A new instance using the thread-local 
 $(D RegionAllocatorStack) instance is created using the global
-$(XREF regionallocator, newRegionAllocator) function.  A new instance using 
+$(D newRegionAllocator) function.  A new instance using 
 an explicitly created $(D RegionAllocatorStack) is created using 
 $(D RegionAllocatorStack.newRegionAllocator).
 
 Each instance has reference semantics in that any copy will allocate from the 
 same memory.  When the last copy of an instance goes out of scope, all memory 
 allocated via that instance is freed.  Only the most recently created 
-$(D RegionAllocator) using a given $(D RegionAllocatorStack) still in existence 
-may be used to allocate and free memory at any given time.
-This is checked via assertions in debug mode, but for performance reasons
-it is not checked in release mode.
+still-existing $(D RegionAllocator) using a given $(D RegionAllocatorStack)  
+may be used to allocate and free memory at any given time.  Deviations
+from this model result in a $(D RegionAllocatorException) being thrown.
+
+An uninitialized $(D RegionAllocator) (for example $(D RegionAllocator.init))
+has semantics similar to a null pointer.  It may be assigned to or passed to
+a function.  However, any attempt to call a method will result in a
+$(D RegionAllocatorException) being thrown.  
 
 Examples:
 ---
@@ -415,6 +459,19 @@ void* dontDoThis() {
     // most recently created one that's still alive from a given stack.
     auto ptr = alloc.allocate(42);
 }
+
+void uninitialized() {
+    RegionAllocator alloc;
+    auto ptr = alloc.allocate(42);  // Error:  alloc is not initialized.
+    auto alloc2 = alloc;  // Ok.  Both alloc, alloc2 are uninitialized.
+    
+    alloc2 = newRegionAllocator();
+    auto ptr2 = alloc2.allocate(42);  // Ok.
+    auto ptr3 = alloc.allocate(42);  // Error:  alloc is still uninitialized.
+    
+    alloc = alloc2;
+    auto ptr4 = alloc.allocate(42);  // Ok.
+}    
 ---
 */
 struct RegionAllocator {
@@ -422,132 +479,75 @@ private:
     RegionAllocatorStack stack;
     
     // The region index that should be current anytime this instance is
-    // being used.  This is checked for in debug mode to prevent any
-    // but the last created RegionAllocator instance from being used.
+    // being used.  This is checked for in allocate() and free().
     size_t correctRegionIndex = size_t.max;
+    
+    this(ref RegionAllocatorStack stack) {
+        assert(stack.initialized);
+        auto impl = &(stack.impl.refCountedPayload());
+        this.stack = stack;
+        
+        with(*impl) {
+            putLast(regionIndex);
+            putLast(1);
+            regionIndex = totalAllocs;
+            correctRegionIndex = regionIndex;
+        }
+    }
     
     // CTFE function, for static assertions.  Can't use bsr/bsf b/c it has
     // to be usable at compile time.
-    static bool isPowerOf2(size_t num) pure {
-        int nBitsSet;
-        foreach(shift; 0..size_t.sizeof * 8) {
-            size_t mask = (cast(size_t) 1) << shift;
-            nBitsSet += ((num & mask) > 0);
-        }
-
-        return nBitsSet == 1;
+    static bool isPowerOf2(size_t num) pure nothrow @safe {
+        return num && !(num & (num - 1));
     }
     
     alias RegionAllocatorStackImpl Impl;  // Save typing.
 
-    ref Impl getStackImpl()() {
-        assert(stack.initialized, 
-            "RegionAllocator's stack is not initialized.  Please use " ~
-            "newRegionAllocator() to create a RegionAllocator object.");
-        return stack.impl.refCountedPayload;
-    }
-
-    static void regionInit(ref Impl impl) {
-        with(impl) {
-            putLast(regionIndex);
-            putLast(1);
-            regionIndex = totalAllocs;
+    // This is written as a mixin instead of a function because it's 
+    // performance critical and it wouldn't be inlinable because it throws.
+    // By using a mixin, initialized can be checked all the time instead of
+    // just in debug mode, for negligible performance cost.
+    enum string getStackImplMixin = q{
+        if(!initialized) {
+            throw new RegionAllocatorException(
+                "RegionAllocator instance not initialized.  Please use " ~
+                "newRegionAllocator() to create a RegionAllocator object."
+            );
         }
-    }
-
-    static void regionFree(ref Impl impl) {
-        with(impl) {
-            while (totalAllocs > regionIndex) {
-                free(impl);
-            }
-            totalAllocs -= 2;  // Reference count, frame index.
-            regionIndex = cast(size_t) lastAlloc[totalAllocs];
-        }
-    }
+        
+        auto impl = &(stack.impl.refCountedPayload());
+    };
 
     void incrementRefCount() {
-        getStackImpl().lastAlloc[correctRegionIndex - 1]++;
+        mixin(getStackImplMixin);
+        impl.lastAlloc[correctRegionIndex - 1]++;
     }
 
     void decrementRefCount() {
-        auto impl = &(getStackImpl());
+        mixin(getStackImplMixin);
         impl.lastAlloc[correctRegionIndex - 1]--;
+        
         if(cast(size_t) impl.lastAlloc[correctRegionIndex - 1] == 0) {
-            enforce(impl.regionIndex == correctRegionIndex,
-                "Cannot free RegionAlloc regions in non-last in first out " ~
-                "order.  Did you return a RegionAllocator from a function?"
-            );
-            regionFree(*impl);
-        }
-    }
-
-    void* allocate()(size_t nBytes, ref Impl impl) {
-        nBytes = allocSize(nBytes);
-        with(impl) {
-            void* ret;
-            if (segmentSize - used >= nBytes) {
-                ret = space + used;
-                used += nBytes;
-            } else if (nBytes > segmentSize) {
-                ret = alignedMalloc(nBytes, gcScanned);
-            } else if (nfree > 0) {
-                inUse.push(Block(used, space));
-                space = freelist.pop;
-                used = nBytes;
-                nfree--;
-                nblocks++;
-                ret = space;
-            } else { // Allocate more space.
-                inUse.push(Block(used, space));
-                space = alignedMalloc(segmentSize, gcScanned);
-                nblocks++;
-                used = nBytes;
-                ret = space;
-            }
-            putLast(ret);
-            return ret;
-        }
-    }
-
-    static void free()(ref Impl impl) {
-        with(impl) {
-            void* lastPos = lastAlloc[--totalAllocs];
-
-            // Handle large blocks.
-            if (lastPos > space + segmentSize || lastPos < space) {
-                alignedFree(lastPos);
-                return;
+            if(impl.regionIndex != correctRegionIndex) {
+                throw new RegionAllocatorException(
+                    "Cannot free RegionAlloc regions in non-last in first " ~
+                    "out order.  Did you return a RegionAllocator from a " ~
+                    "function?"
+                );
             }
 
-            used = (cast(size_t) lastPos) - (cast(size_t) space);
-            if (nblocks > 1 && used == 0) {
-                freelist.push(space);
-                Block newHead = inUse.pop;
-                space = newHead.space;
-                used = newHead.used;
-                nblocks--;
-                nfree++;
-
-                if (nfree >= nblocks * 2) {
-                    foreach(i; 0..nfree / 2) {
-                        alignedFree(freelist.pop);
-                        nfree--;
-                    }
+            with(*impl) {
+                while (totalAllocs > regionIndex) {
+                    freeLast();
                 }
+                totalAllocs -= 2;  // Reference count, frame index.
+                regionIndex = cast(size_t) lastAlloc[totalAllocs];
             }
         }
     }
 
     bool initialized() @property const pure nothrow @safe {
         return correctRegionIndex < size_t.max;
-    }
-
-    void ensureInitialized() {
-        if(!initialized) {
-            auto impl = &(getStackImpl());
-            regionInit(*impl);
-            correctRegionIndex = impl.regionIndex;
-        }
     }
     
     Unqual!(ElementType!(R))[] arrayImplStack(R)(R range) {
@@ -558,11 +558,11 @@ private:
             copy(range, ret);
             return ret;
         } else {
-            auto impl = &(getStackImpl());
+            mixin(getStackImplMixin);
             auto startPtr = allocate(0);
             size_t bytesCopied = 0;
 
-            while(!range.empty) {  // Make sure range interface is being used.
+            while(!range.empty) {
                 auto elem = range.front;
                 if(impl.used + U.sizeof <= segmentSize) {
                     range.popFront;
@@ -612,9 +612,9 @@ private:
     }
 
     Unqual!(ElementType!(R))[] arrayImplHeap(R)(R range) {
-        // Initial guess of how much space to allocate.  It's relatively large b/c
-        // the object will be short lived, so speed is more important than space
-        // efficiency.
+        // Initial guess of how much space to allocate.  It's relatively large 
+        // b/c the object will be short lived, so speed is more important than 
+        // space efficiency.
         enum initialGuess = 128;
 
         alias Unqual!(ElementType!R) E;
@@ -622,27 +622,26 @@ private:
             [0..initialGuess];
 
         finishCopy(arr, range, 0);
-        getStackImpl().putLast(arr.ptr);
+        mixin(getStackImplMixin);
+        impl.putLast(arr.ptr);
         return arr;
     }
 
 public:
-
+    
     this(this) {
-        ensureInitialized();
-        incrementRefCount();
+        if(initialized) incrementRefCount();
     }
 
     ~this() {
         if(initialized) decrementRefCount();
     }
 
-    /**
-    Assignment of one RegionAllocator to another is disabled.
-    */
-    void opAssign(RegionAllocator rhs) @disable {
-        // BUGS:  DMD Bug 6330:  @disable doesn't do anything.
-        assert(0);
+    void opAssign(RegionAllocator rhs) {
+        if(initialized) decrementRefCount();
+        this.stack = rhs.stack;
+        this.correctRegionIndex = rhs.correctRegionIndex;
+        if(initialized) incrementRefCount();
     }
 
     /**
@@ -651,47 +650,103 @@ public:
     $(D RegionAllocator) instance can be freed by calling
     $(D RegionAllocator.free) or $(D RegionAllocator.freeLast) or will be
     automatically freed when the last copy of this $(D RegionAllocator)
-    instance goes out of scope.  The memory returned by this function is not
-    scanned for pointers by the garbage collector unless $(D GC.addRange) is
-    called.
+    instance goes out of scope.
     */
-    void* allocate()(size_t nBytes) {
-        // This is a template to allow assertions to be enabled or disabled
-        // based on how the call site is compiled.
-
-        ensureInitialized();
-        auto impl = &(getStackImpl());
-        assert(impl.regionIndex == this.correctRegionIndex,
-            "Cannot allocate memory from a RegionAllocator that is not " ~
-            "currently at the top of the stack." ~ text(impl.regionIndex,
-            '\t', this.correctRegionIndex)
-        );
-        return allocate(nBytes, *impl);
+    void* allocate(size_t nBytes) {
+        mixin(getStackImplMixin);
+        if(impl.regionIndex != this.correctRegionIndex) {
+            throw new RegionAllocatorException(
+                "Cannot allocate memory from a RegionAllocator that is not " ~
+                "currently at the top of the stack."
+            );
+        }
+        
+        nBytes = allocSize(nBytes);
+        with(*impl) {
+            void* ret;
+            if (segmentSize - used >= nBytes) {
+                ret = space + used;
+                used += nBytes;
+            } else if (nBytes > segmentSize) {
+                ret = alignedMalloc(nBytes, gcScanned);
+            } else if (nfree > 0) {
+                inUse.push(Block(used, space));
+                space = freeList.pop;
+                used = nBytes;
+                nfree--;
+                nblocks++;
+                ret = space;
+            } else { // Allocate more space.
+                inUse.push(Block(used, space));
+                space = alignedMalloc(segmentSize, gcScanned);
+                nblocks++;
+                used = nBytes;
+                ret = space;
+            }
+            putLast(ret);
+            return ret;
+        }
     }
 
     /**
     Frees the last block of memory allocated by the current
-    $(D RegionAllocator).
+    $(D RegionAllocator).  Throws a $(D RegionAllocatorException) if
+    this $(D RegionAllocator) is not the most recently created still-existing
+    $(D RegionAllocator) using its $(D RegionAllocatorStack) instance.
     */
-    void freeLast()() {
-        auto impl = &(getStackImpl());
-        assert(impl.regionIndex == this.correctRegionIndex,
-            "Cannot allocate memory from a RegionAllocator that is not " ~
-            "currently at the top of the stack, or memory that has not been " ~
-            "allocated with this instance."
-        );
-        free(*impl);
+    void freeLast() {
+        mixin(getStackImplMixin);
+        if(impl.regionIndex != this.correctRegionIndex) {
+            throw new RegionAllocatorException(
+                "Cannot free memory to a RegionAllocator that is not " ~
+                "currently at the top of the stack, or memory that has not " ~
+                "been allocated with this instance."
+            );
+        }
+
+        with(*impl) {
+            void* lastPos = lastAlloc[--totalAllocs];
+
+            // Handle large blocks.
+            if (lastPos > space + segmentSize || lastPos < space) {
+                alignedFree(lastPos);
+                return;
+            }
+
+            used = (cast(size_t) lastPos) - (cast(size_t) space);
+            if (nblocks > 1 && used == 0) {
+                freeList.push(space);
+                Block newHead = inUse.pop;
+                space = newHead.space;
+                used = newHead.used;
+                nblocks--;
+                nfree++;
+
+                if (nfree >= nblocks * 2) {
+                    foreach(i; 0..nfree / 2) {
+                        alignedFree(freeList.pop);
+                        nfree--;
+                    }
+                }
+            }
+        }
     }
 
     /**
-    Checks that $(D ptr) is a pointer to the last chunk allocated and then
-    frees it.  Throws an exception if the last allocated-first freed
-    requirement is violated.
+    Checks that $(D ptr) is a pointer to the block that would be freed by
+    $(D freeLast) then calls $(D freeLast).  Throws a 
+    $(D RegionAllocatorException) if the pointer does not point to the
+    block that would be freed by $(D freeLast).
     */
-    void free()(void* ptr) {
-        auto impl = &(getStackImpl());
+    void free(void* ptr) {
+        mixin(getStackImplMixin);
         void* lastPos = impl.lastAlloc[impl.totalAllocs - 1];
-        enforce(ptr is lastPos);
+        if(ptr !is lastPos) {
+            throw new RegionAllocatorException(
+                "Cannot free RegionAllocator memory in non-LIFO order."
+            );
+        }
+        
         freeLast();
     }
     
@@ -703,10 +758,9 @@ public:
         return stack.gcScanned;
     }
 
-    /**Allocates an array of type $(D T)  The returned array is not scanned 
-    for pointers by the garbage collector unless $(D GC.addRange) is called.   
-    $(D T) may be a multidimensional array.  In this case sizes may be 
-    specified for any number of dimensions from 1 to the number in $(D T).
+    /**Allocates an array of type $(D T).  $(D T) may be a multidimensional 
+    array.  In this case sizes may be specified for any number of dimensions 
+    from 1 to the number in $(D T).
 
     Examples:
     ---
@@ -803,8 +857,8 @@ public:
     enum isScoped = true;
 
     /**
-    If memory is freed via $(D free()) instead of $(D freeLast()) then
-    the pointer is checked for validity.
+    True because if memory is freed via $(D free()) instead of $(D freeLast()) 
+    then the pointer is checked for validity.
     */
     enum freeIsChecked = true;
 
@@ -812,7 +866,8 @@ public:
     Returns the segment size of this $(D RegionAllocator).
     */
     size_t segmentSize() @property {
-        return getStackImpl().segmentSize;
+        mixin(getStackImplMixin);
+        return impl.segmentSize;
     }
 
     /**
@@ -820,8 +875,8 @@ public:
     current segment.
     */
     size_t segmentSlack() @property {
-        auto impl = &(getStackImpl());
-        return segmentSize - impl.used;
+        mixin(getStackImplMixin);
+        return impl.segmentSize - impl.used;
     }
 
     /**
@@ -874,9 +929,7 @@ Returns a new $(D RegionAllocator) that uses the default thread-local
 $(D RegionAllocatorStack) instance.
 */
 RegionAllocator newRegionAllocator() {
-    auto ret = RegionAllocator(getThreadLocal());
-    ret.ensureInitialized();
-    return ret;
+    return RegionAllocator(getThreadLocal());
 }
 
 // Finishes copying a range to a C heap allocated array.  Assumes the first
@@ -929,8 +982,9 @@ unittest {
     assert(asArray.length == 1024 * 1025);
     alloc.freeLast();
     alloc.freeLast();
-    while(alloc.getStackImpl().freelist.index > 0) {
-        alignedFree(alloc.getStackImpl().freelist.pop);
+    
+    while(alloc.stack.impl.refCountedPayload.freeList.index > 0) {
+        alignedFree(alloc.stack.impl.refCountedPayload.freeList.pop());
     }
 }
 
@@ -970,14 +1024,14 @@ unittest {
          foreach(i; 0..nIter) {
              alloc.allocate(alignBytes);
          }
-         assert(alloc.getStackImpl().nblocks == 5,
-            to!string(alloc.getStackImpl().nblocks));
-         assert(alloc.getStackImpl().nfree == 0);
+         assert(alloc.stack.impl.refCountedPayload.nblocks == 5,
+            to!string(alloc.stack.impl.refCountedPayload.nblocks));
+         assert(alloc.stack.impl.refCountedPayload.nfree == 0);
          foreach(i; 0..nIter) {
             alloc.freeLast();
         }
-        assert(alloc.getStackImpl().nblocks == 1);
-        assert(alloc.getStackImpl().nfree == 2);
+        assert(alloc.stack.impl.refCountedPayload.nblocks == 1);
+        assert(alloc.stack.impl.refCountedPayload.nfree == 2);
 
         // Make sure logic for freeing excess blocks works.  If it doesn't this
         // test will run out of memory.
@@ -998,22 +1052,18 @@ unittest {
         foreach(i; 0..5) {
             alloc.freeLast();
         }
-        void* space = alloc.getStackImpl().space;
-        size_t used = alloc.getStackImpl().used;
+        void* space = alloc.stack.impl.refCountedPayload.space;
+        size_t used = alloc.stack.impl.refCountedPayload.used;
 
         {
             auto alloc2 = newRegionAllocator();
-
-            // This array of arrays should not be scanned by the GC because
-            // otherwise bugs caused the not having the GC scan certain internal
-            // things in RegionAllocator that it should would not be exposed.
-            uint[][] arrays = (cast(uint[]*) GC.malloc((uint[]).sizeof * 10,
-                               GC.BlkAttr.NO_SCAN))[0..10];
+            auto arrays = new uint[][10];
+            
             foreach(i; 0..10) {
                 uint[] data = alloc2.uninitializedArray!(uint[])(250_000);
                 foreach(j, ref e; data) {
-                    e = cast(uint) (j * (i + 1));  // Arbitrary values that can be read back later.
-                }
+                    e = cast(uint) (j * (i + 1));  
+                                    }
                 arrays[i] = data;
             }
 
@@ -1033,10 +1083,11 @@ unittest {
             }
         }
 
-        assert(space == alloc.getStackImpl().space,
-            text(space, '\t', alloc.getStackImpl().space));
-        assert(used == alloc.getStackImpl().used);
-        while(alloc.getStackImpl().nblocks > 1 || alloc.getStackImpl().used > 0) {
+        assert(space == alloc.stack.impl.refCountedPayload.space,
+            text(space, '\t', alloc.stack.impl.refCountedPayload.space));
+        assert(used == alloc.stack.impl.refCountedPayload.used);
+        while(alloc.stack.impl.refCountedPayload.nblocks > 1 || 
+        alloc.stack.impl.refCountedPayload.used > 0) {
             alloc.freeLast();
         }
     }
@@ -1094,6 +1145,17 @@ unittest {
         t.start();
         t.join();
     }
+}
+
+unittest {
+    // Make sure assignment works as advertised.
+    RegionAllocator alloc;
+    auto alloc2 = newRegionAllocator();
+    auto ptr = alloc2.allocate(8);
+    alloc = alloc2;
+    alloc.freeLast();
+    auto ptr2= alloc2.allocate(8);
+    assert(ptr is ptr2);
 }
 
  // Simple, fast stack w/o error checking.
