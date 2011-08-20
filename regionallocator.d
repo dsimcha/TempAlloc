@@ -349,7 +349,7 @@ regionallocator, GCScan) for details.)
 The setter is only effective before the global function
 $(D newRegionAllocator) has been called for the first time in the current
 thread.  Attempts to set this property after the first call to this
-function from the current thread throw an $(D Exception).
+function from the current thread throw a $(D RegionAllocatorException).
 */
 bool scanThreadLocalStack() @property nothrow @safe {
     return _scanThreadLocalStack;
@@ -417,7 +417,7 @@ void foo() {
     auto ptr1 = bar(alloc);
     auto ptr2 = alloc.allocate(42);
 
-    // The last instance of the region allocator used to allocate ptr1
+    // The last copy of the RegionAllocator object used to allocate ptr1
     // and ptr2 is going out of scope here.  The memory pointed to by
     // both ptr1 and ptr2 will be freed.
 }
@@ -430,7 +430,7 @@ void* bar(RegionAllocator alloc) {
 
     // ptr3 was allocated using alloc2, which is going out of scope.
     // Its memory will therefore be freed.  ret was allocated using alloc.
-    // An instance of this RegionAllocator is still alive in foo() after
+    // A copy of this RegionAllocator is still alive in foo() after
     // bar() executes.  Therefore, ret will not be freed on returning and
     // is still valid after bar() returns.
 
@@ -651,6 +651,11 @@ public:
     $(D RegionAllocator.free) or $(D RegionAllocator.freeLast) or will be
     automatically freed when the last copy of this $(D RegionAllocator)
     instance goes out of scope.
+    
+    Allocation requests larger than $(D segmentSize) are
+    allocated directly on the C heap, are scanned by the GC iff
+    the $(D RegionAllocatorStack) instance that this object uses is scanned by
+    the GC, and are freed according to the same rules as described above.
     */
     void* allocate(size_t nBytes) {
         mixin(getStackImplMixin);
@@ -708,7 +713,7 @@ public:
             void* lastPos = lastAlloc[--totalAllocs];
 
             // Handle large blocks.
-            if (lastPos > space + segmentSize || lastPos < space) {
+            if(lastPos > space + segmentSize || lastPos < space) {
                 alignedFree(lastPos);
                 return;
             }
@@ -748,6 +753,49 @@ public:
         }
         
         freeLast();
+    }
+    
+    /**
+    Attempts to resize a previously allocated block of memory in place.  
+    This is possible only if $(D ptr) points to the beginning of the last
+    block allocated by this $(D RegionAllocator) instance and, in the
+    case where $(D newSize) is greater than the old size, there is
+    additional space in the segment that $(D ptr) was allocated from.  
+    Additionally, blocks larger than this $(D RegionAllocator)'s segment size
+    cannot be grown or shrunk.
+    
+    Returns:  True if the block was successfully resized, false otherwise.
+    */
+    bool resize(const(void)* ptr, size_t newSize) {
+        mixin(getStackImplMixin);
+        
+        // This works since we always allocate in increments of alignBytes
+        // no matter what the allocation size.
+        newSize = allocSize(newSize);
+        
+        with(*impl) {
+            void* lastPos = lastAlloc[totalAllocs - 1];
+            if(ptr !is lastPos) {
+                return false;
+            }
+
+            // If it's a large block directly allocated on the heap,
+            // then we definitely can't resize it in place.
+            if(lastPos > space + segmentSize || lastPos < space) {
+                return false;
+            }           
+        
+            immutable blockSize = used - ((cast(size_t) lastPos) -
+                cast(size_t) space);
+            immutable sizediff_t diff = newSize - blockSize;
+            
+            if(cast(sizediff_t) (impl.segmentSize - used) >= diff) {
+                used += diff;
+                return true;
+            }
+        }
+        
+        return false;
     }
     
     /**
@@ -819,14 +867,6 @@ public:
     }
 
     /**
-    Dummy implementation for compatibility with allocator interface.
-    Always returns false.
-    */
-    static bool resize(void* p, size_t newSize) {
-        return false;
-    }
-
-    /**
     Returns the number of bytes to which an allocation of size nBytes is
     guaranteed to be aligned.
     */
@@ -863,7 +903,8 @@ public:
     enum freeIsChecked = true;
 
     /**
-    Returns the segment size of this $(D RegionAllocator).
+    Returns the segment size of the $(D RegionAllocatorStack) used by this
+    $(D RegionAllocator).
     */
     size_t segmentSize() @property {
         mixin(getStackImplMixin);
@@ -1129,6 +1170,30 @@ unittest {
     foreach(i; 0..100_000) {
         auto stack = RegionAllocatorStack(4 * 1024 * 1024, GCScan.no);
     }
+}
+
+unittest {
+    // Make sure resize works properly.
+    auto alloc = newRegionAllocator();
+    auto arr1 = alloc.array(iota(4));
+    auto res = alloc.resize(arr1.ptr, 8 * int.sizeof);
+    assert(res);
+    arr1 = arr1.ptr[0..8];
+    copy(iota(4, 8), arr1[4..$]);
+    
+    auto arr2 = alloc.newArray!(int[])(8);
+    
+    // If resizing resizes to something too small, this will have been 
+    // overwritten:
+    assert(arr1 == [0, 1, 2, 3, 4, 5, 6, 7], text(arr1));
+    
+    alloc.free(arr2.ptr);
+    auto res2 = alloc.resize(arr1.ptr, 4 * int.sizeof);
+    assert(res2);
+    arr2 = alloc.newArray!(int[])(8);
+    
+    // This time the memory in arr1 should have been overwritten.
+    assert(arr1 == [0, 1, 2, 3, 0, 0, 0, 0]);
 }
 
 unittest {
