@@ -227,10 +227,10 @@ private struct RegionAllocatorStackImpl {
 
         // We don't need 16-byte alignment for the bookkeeping array.
         immutable nBookKeep = segmentSize / alignBytes;
-        lastAlloc = (cast(void**) core.stdc.stdlib.malloc(nBookKeep))
-                    [0..nBookKeep / ptrSize];
+        bookkeep = (cast(SizetPtr*) core.stdc.stdlib.malloc(nBookKeep))
+                    [0..nBookKeep / SizetPtr.sizeof];
         
-        if(!lastAlloc.ptr) {
+        if(!bookkeep.ptr) {
             outOfMemory();
         }
         
@@ -241,8 +241,8 @@ private struct RegionAllocatorStackImpl {
     
     size_t used;
     void* space;
-    size_t totalAllocs;
-    void*[] lastAlloc;
+    size_t bookkeepIndex;
+    SizetPtr[] bookkeep;
     uint nblocks;
     uint nfree;
     size_t regionIndex = size_t.max;
@@ -259,23 +259,23 @@ private struct RegionAllocatorStackImpl {
     SimpleStack!(void*) freeList;
     
 
-    void doubleSize(ref void*[] lastAlloc) {
-        size_t newSize = lastAlloc.length * 2;
-        void** ptr = cast(void**) core.stdc.stdlib.realloc(
-            lastAlloc.ptr, newSize * ptrSize);
+    void doubleSize(ref SizetPtr[] bookkeep) {
+        size_t newSize = bookkeep.length * 2;
+        auto ptr = cast(SizetPtr*) core.stdc.stdlib.realloc(
+            bookkeep.ptr, newSize * SizetPtr.sizeof);
             
         if(!ptr) {
             outOfMemory();
         }
         
-        lastAlloc = ptr[0..newSize];
+        bookkeep = ptr[0..newSize];
     }
 
-    // Add an element to lastAlloc, checking length first.
+    // Add an element to bookkeep, checking length first.
     void putLast(void* last) {
-        if (totalAllocs == lastAlloc.length) doubleSize(lastAlloc);
-        lastAlloc[totalAllocs] = cast(void*) last;
-        totalAllocs++;
+        if (bookkeepIndex == bookkeep.length) doubleSize(bookkeep);
+        bookkeep[bookkeepIndex].p = cast(void*) last;
+        bookkeepIndex++;
     }
 
     // Hacky use of the same array to store frame indices, reference
@@ -290,9 +290,9 @@ private struct RegionAllocatorStackImpl {
             space = null;
         }
 
-        if(lastAlloc) {
-            core.stdc.stdlib.free(lastAlloc.ptr);
-            lastAlloc = null;
+        if(bookkeep) {
+            core.stdc.stdlib.free(bookkeep.ptr);
+            bookkeep = null;
         }
 
         while(inUse.index > 0) {
@@ -490,7 +490,7 @@ private:
         with(*impl) {
             putLast(regionIndex);
             putLast(1);
-            regionIndex = totalAllocs;
+            regionIndex = bookkeepIndex;
             correctRegionIndex = regionIndex;
         }
     }
@@ -520,14 +520,14 @@ private:
 
     void incrementRefCount() {
         mixin(getStackImplMixin);
-        impl.lastAlloc[correctRegionIndex - 1]++;
+        impl.bookkeep[correctRegionIndex - 1].i++;
     }
 
     void decrementRefCount() {
         mixin(getStackImplMixin);
-        impl.lastAlloc[correctRegionIndex - 1]--;
+        impl.bookkeep[correctRegionIndex - 1].i--;
         
-        if(cast(size_t) impl.lastAlloc[correctRegionIndex - 1] == 0) {
+        if(impl.bookkeep[correctRegionIndex - 1].i == 0) {
             if(impl.regionIndex != correctRegionIndex) {
                 throw new RegionAllocatorException(
                     "Cannot free RegionAlloc regions in non-last in first " ~
@@ -537,11 +537,11 @@ private:
             }
 
             with(*impl) {
-                while (totalAllocs > regionIndex) {
+                while (bookkeepIndex > regionIndex) {
                     freeLast();
                 }
-                totalAllocs -= 2;  // Reference count, frame index.
-                regionIndex = cast(size_t) lastAlloc[totalAllocs];
+                bookkeepIndex -= 2;  // Reference count, frame index.
+                regionIndex = bookkeep[bookkeepIndex].i;
             }
         }
     }
@@ -587,7 +587,7 @@ private:
                         U[] oldData = (cast(U*) startPtr)
                             [0..bytesCopied / U.sizeof];
                         impl.used -= bytesCopied;
-                        impl.totalAllocs--;
+                        impl.bookkeepIndex--;
                         U[] arr = uninitializedArray!(U[])
                             (bytesCopied / U.sizeof + 1);
                         arr[0..oldData.length] = oldData[];
@@ -710,7 +710,7 @@ public:
         }
 
         with(*impl) {
-            void* lastPos = lastAlloc[--totalAllocs];
+            auto lastPos = bookkeep[--bookkeepIndex].p;
 
             // Handle large blocks.
             if(lastPos > space + segmentSize || lastPos < space) {
@@ -745,7 +745,7 @@ public:
     */
     void free(void* ptr) {
         mixin(getStackImplMixin);
-        void* lastPos = impl.lastAlloc[impl.totalAllocs - 1];
+        auto lastPos = impl.bookkeep[impl.bookkeepIndex - 1].p;
         if(ptr !is lastPos) {
             throw new RegionAllocatorException(
                 "Cannot free RegionAllocator memory in non-LIFO order."
@@ -774,7 +774,7 @@ public:
         newSize = allocSize(newSize);
         
         with(*impl) {
-            void* lastPos = lastAlloc[totalAllocs - 1];
+            auto lastPos = bookkeep[bookkeepIndex - 1].p;
             if(ptr !is lastPos) {
                 return false;
             }
@@ -1057,7 +1057,7 @@ unittest {
     threadLocalInitialized = false;
 
      // First test to make sure a large number of allocations does what it's
-     // supposed to in terms of reallocing lastAlloc[], etc.
+     // supposed to in terms of reallocing bookkeep[], etc.
      enum nIter =  defaultSegmentSize * 5 / alignBytes;
 
     {
@@ -1315,4 +1315,9 @@ private void* alignedRealloc(void* ptr, size_t newLen, size_t oldLen) {
 
     alignedFree(ptr);
     return newPtr;
+}
+
+private union SizetPtr {
+    size_t i;
+    void* p;
 }
