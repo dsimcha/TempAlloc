@@ -1388,4 +1388,3 @@ private union SizetPtr {
     size_t i;
     void* p;
 }
-void main() {}
