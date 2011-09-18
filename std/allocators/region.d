@@ -5,7 +5,8 @@ allocated and freed in last in, first out order.  When memory is requested from
 a segmented stack, it first checks whether enough space is available in the
 current segment, and if so bumps the stack pointer and returns.  If not,
 a new segment is allocated.  When memory is freed, the stack pointer is
-bumped down.  If the last segment is no longer in use, it may be returned to
+bumped down, and multiple allocations can be freed in a single operation.  
+If the last segment is no longer in use, it may be returned to
 where it was allocated from or retained for future use.
 
 Synopsis:
@@ -25,6 +26,11 @@ void fun() {
     // have gone out of scope.
 }
 ---
+
+A segmented stack may be created manually using the two-argument overload
+of $(D newRegionAllocator).  Alternatively, a default thread-local stack may
+be automatically lazily created using the zero-argument overload of this 
+function.
 
 $(D RegionAllocator) has the following advantages compared to allocation on the
 call stack:
@@ -88,10 +94,6 @@ $(OL
 
 )
 
-A segmented stack may be created manually.  Alternatively, a default
-thread-local stack that is automatically created lazily on the first
-attempt to use it may be used.
-
 Author:  David Simcha
 Copyright:  Copyright (c) 2008-2011, David Simcha.
 License:    $(WEB boost.org/LICENSE_1_0.txt, Boost License 1.0)
@@ -119,382 +121,21 @@ private enum ptrSize = (void*).sizeof;
 // until I see proof that it needs to be fixed.
 static assert(bool.sizeof == 1);
 
-enum size_t defaultSegmentSize = 4 * 1_024 * 1_024;
-
-
-/**
-This flag determines whether a given $(D RegionAllocatorStack) is scanned for
-pointers by the garbage collector (GC).  If yes, the entire stack is scanned,
-not just the part currently in use, since there is currently no efficient way to
-modify the bounds of a GC region.  The stack is scanned conservatively, meaning
-that any bit pattern that would point to GC-allocated memory if interpreted as
-a pointer is considered to be a pointer.  This can result in GC-allocated
-memory being retained when it should be freed.  Due to these caveats,
-it is recommended that any stack scanned by the GC be small and/or short-lived.
-*/
-enum GCScan :
-bool
-{
-    ///
-    no = false,
-
-    ///
-    yes = true
-}
-
-/**
-This object represents a segmented stack.  Memory can be allocated from this
-stack using a $(XREF regionallocator, RegionAllocator) object.  Multiple
-$(D RegionAllocator) objects may be created per
-$(D RegionAllocatorStack) but each $(D RegionAllocator) uses a single
-$(D RegionAllocatorStack).
-
-For most use cases it's convenient to use the default thread-local
-instance of $(D RegionAllocatorStack), which is lazily instantiated on
-the first call to the global function
-$(XREF regionallocator, newRegionAllocator).  Occasionally it may be useful
-to have multiple independent stacks in one thread, in which case a
-$(D RegionAllocatorStack) can be created manually.
-
-$(D RegionAllocatorStack) is reference counted and has reference semantics.
-When the last copy of a given instance goes out of scope, the memory
-held by the $(D RegionAllocatorStack) instance is released back to the
-heap.  This cannot happen before memory allocated to a $(D RegionAllocator)
-instance is released back to the stack, because a $(D RegionAllocator)
-holds a copy of the $(D RegionAllocatorStack) instance it uses.
-
-Examples:
----
-import std.regionallocator;
-
-void main() {
-    fun1();
-}
-
-void fun1() {
-    auto stack = RegionAllocatorStack(1_048_576, GCScan.no);
-    fun2(stack);
-
-    // At the end of fun1, the last copy of the RegionAllocatorStack
-    // instance pointed to by stack goes out of scope.  The memory
-    // held by stack is released back to the heap.
-}
-
-void fun2(RegionAllocatorStack stack) {
-    auto alloc = stack.newRegionAllocator();
-    auto arr = alloc.newArray!(double[])(1_024);
-
-    // At the end of fun2, the last copy of the RegionAllocator instance
-    // pointed to by alloc goes out of scope.  The memory used by arr
-    // is released back to stack.
-}
----
-*/
-struct RegionAllocatorStack
-{
-private:
-    RefCounted!(RegionAllocatorStackImpl, RefCountedAutoInitialize.no) impl;
-    bool initialized;
-    bool _gcScanned;
-
-public:
-    /**
-    Create a new $(D RegionAllocatorStack) with a given segment size in bytes.
-    
-    Throws:  $(D RegionAllocatorError) when $(D segmentSize) is zero.
-    */
-    this(size_t segmentSize, GCScan shouldScan)
-    {
-        this._gcScanned = shouldScan;
-        if(segmentSize == 0)
-        {
-            throw new RegionAllocatorError(
-                "Cannot create a RegionAllocatorStack with segment size of 0.",
-                __FILE__, __LINE__
-            );
-        }
-
-        impl = typeof(impl)(segmentSize, shouldScan);
-        initialized = true;
-    }
-
-    /**
-    Creates a new $(D RegionAllocator) region using this stack.
-    */
-    RegionAllocator newRegionAllocator()
-    {
-        if(!initialized)
-        {
-            throw new RegionAllocatorError(
-                "Cannot create a RegionAllocator from an " ~
-                "uninitialized RegionAllocatorStack.  Did you call " ~
-                "RegionAllocatorStack's constructor?",
-                __FILE__,
-                __LINE__
-            );
-        }
-
-        return RegionAllocator(this);
-    }
-
-    /**
-    Whether this stack is scanned by the garbage collector.
-    */
-    bool gcScanned() @property const pure nothrow @safe
-    {
-        return _gcScanned;
-    }
-}
-
-private struct RegionAllocatorStackImpl
-{
-
-    this(size_t segmentSize, GCScan shouldScan)
-    {
-        this.segmentSize = segmentSize;
-        space = alignedMalloc(segmentSize, shouldScan);
-
-        // We don't need 16-byte alignment for the bookkeeping array.
-        immutable nBookKeep = segmentSize / alignBytes;
-        bookkeep = (cast(SizetPtr*) core.stdc.stdlib.malloc(nBookKeep))
-                   [0..nBookKeep / SizetPtr.sizeof];
-
-        if(!bookkeep.ptr)
-        {
-            outOfMemory();
-        }
-
-        nBlocks++;
-    }
-
-    size_t segmentSize;  // The size of each segment.
-
-    size_t used;
-    void* space;
-    size_t bookkeepIndex;
-    SizetPtr[] bookkeep;
-    uint nBlocks;
-    uint nFree;
-    size_t regionIndex = size_t.max;
-
-    // inUse holds info for all blocks except the one currently being
-    // allocated from.  freeList holds space ptrs for all free blocks.
-
-    static struct Block
-    {
-        size_t used = 0;
-        void* space = null;
-    }
-
-    SimpleStack!(Block) inUse;
-    SimpleStack!(void*) freeList;
-
-    void doubleSize(ref SizetPtr[] bookkeep)
-    {
-        size_t newSize = bookkeep.length * 2;
-        auto ptr = cast(SizetPtr*) core.stdc.stdlib.realloc(
-                       bookkeep.ptr, newSize * SizetPtr.sizeof);
-
-        if(!ptr)
-        {
-            outOfMemory();
-        }
-
-        bookkeep = ptr[0..newSize];
-    }
-
-    // Add an element to bookkeep, checking length first.
-    void putLast(void* last)
-    {
-        if (bookkeepIndex == bookkeep.length) doubleSize(bookkeep);
-        bookkeep[bookkeepIndex].p = last;
-        bookkeepIndex++;
-    }
-
-    void putLast(size_t num)
-    {
-        return putLast(cast(void*) num);
-    }
-
-    // The number of objects allocated on the C heap instead of here.
-    ref size_t nLargeObjects() @property pure nothrow
-    {
-        return bookkeep[regionIndex - 4].i;
-    }
-
-    // The number of extra segments that have been allocated in the current
-    // region beyond the base segment of the region.
-    ref size_t nExtraSegments() @property pure nothrow
-    {
-        return bookkeep[regionIndex - 3].i;
-    }
-
-    // Pushes a segment to the internal free list and frees segments to the
-    // heap if there are more than 2x as many segments on the free list as
-    // in use.
-    void freeSegment()
-    {
-        nExtraSegments--;
-        freeList.push(space);
-        auto newHead = inUse.pop();
-        space = newHead.space;
-        used = newHead.used;
-        nBlocks--;
-        nFree++;
-
-        if (nFree >= nBlocks * 2)
-        {
-            foreach(i; 0..nFree / 2)
-            {
-                alignedFree(freeList.pop);
-                nFree--;
-            }
-        }
-    }
-
-    void destroy()
-    {
-        if(space)
-        {
-            alignedFree(space);
-            space = null;
-        }
-
-        if(bookkeep)
-        {
-            core.stdc.stdlib.free(bookkeep.ptr);
-            bookkeep = null;
-        }
-
-        while(inUse.index > 0)
-        {
-            auto toFree = inUse.pop();
-            alignedFree(toFree.space);
-        }
-
-        inUse.destroy();
-
-        while(freeList.index > 0)
-        {
-            auto toFree = freeList.pop();
-            alignedFree(toFree);
-        }
-
-        freeList.destroy();
-    }
-
-    ~this()
-    {
-        destroy();
-    }
-}
-
-/**
-These properties get and set the segment size of the default thread-local
-$(D RegionAllocatorStack) instance.  The default size is 4 megabytes.
-The setter is only effective before the global function
-$(D newRegionAllocator) has been called for the first time in the current
-thread.  Attempts to set this property after the first call to this
-function from the current thread throw a $(D RegionAllocatorError).
-*/
-size_t threadLocalSegmentSize() @property nothrow @safe
-{
-    return _threadLocalSegmentSize;
-}
-
-/// Ditto
-size_t threadLocalSegmentSize(size_t newSize) @property @safe
-{
-    if(threadLocalInitialized)
-    {
-        throw new RegionAllocatorError(
-            "Cannot set threadLocalSegmentSize after the thread-local " ~
-            "RegionAllocatorStack has been used for the first time.",
-            __FILE__,
-            __LINE__
-        );
-    }
-
-    return _threadLocalSegmentSize = newSize;
-}
-
-/**
-These properties determine whether the default thread-local
-$(D RegionAllocatorStack) instance is scanned by the garbage collector.
-The default is no.  In most cases, scanning a stack this long-lived is not
-recommended, as it will cause too many false pointers.  (See $(XREF
-regionallocator, GCScan) for details.)
-
-The setter is only effective before the global function
-$(D newRegionAllocator) has been called for the first time in the current
-thread.  Attempts to set this property after the first call to this
-function from the current thread throw a $(D RegionAllocatorError).
-*/
-bool threadLocalStackIsScannable() @property nothrow @safe
-{
-    return _threadLocalStackIsScannable;
-}
-
-/// Ditto
-bool threadLocalStackIsScannable(bool shouldScan) @property @safe
-{
-    if(threadLocalInitialized)
-    {
-        throw new RegionAllocatorError(
-            "Cannot set threadLocalStackIsScannable after the thread-local " ~
-            "RegionAllocatorStack has been used for the first time.",
-            __FILE__,
-            __LINE__
-        );
-    }
-
-    return _threadLocalStackIsScannable = shouldScan;
-}
-
-private size_t _threadLocalSegmentSize = defaultSegmentSize;
-private RegionAllocatorStack threadLocalStack;
-private bool threadLocalInitialized;
-private bool _threadLocalStackIsScannable = false;
-
-// Ensures the thread-local stack is initialized, then returns it.
-private ref RegionAllocatorStack getThreadLocal()
-{
-    if(!threadLocalInitialized)
-    {
-        threadLocalInitialized = true;
-        threadLocalStack = RegionAllocatorStack(
-                               threadLocalSegmentSize, cast(GCScan) threadLocalStackIsScannable
-                           );
-    }
-
-    return threadLocalStack;
-}
-
-static ~this()
-{
-    if(threadLocalInitialized)
-    {
-        threadLocalStack.impl.refCountedPayload.destroy();
-    }
-}
+private enum size_t defaultSegmentSize = 4 * 1_024 * 1_024;
 
 /**
 This struct provides an interface to the $(D RegionAllocator) functionality
-and enforces scoped deletion.  A new instance using the thread-local
-$(D RegionAllocatorStack) instance is created using the global
-$(D newRegionAllocator) function.  A new instance using
-an explicitly created $(D RegionAllocatorStack) is created using
-$(D RegionAllocatorStack.newRegionAllocator).  An instance of a
-$(D RegionAllocator) is defined as a $(D RegionAllocator) created by
-calling one of these $(D newRegionAllocator) functions and all copies
-of this initial object.
+and enforces scoped deletion.  A new instance is created using the
+$(D newRegionAllocator) function or the $(D RegionAllocator.nested) function.  
+An instance of a $(D RegionAllocator) is defined as a $(D RegionAllocator) 
+created by calling one of these functions and all copies of this initial object.
 
 Each instance has reference semantics in that any copy will allocate from the
 same memory.  When the last copy of an instance goes out of scope, all memory
 allocated via that instance is freed.  Only the most recently created
-still-existing $(D RegionAllocator) using a given $(D RegionAllocatorStack)
-may be used to allocate and free memory at any given time.  Deviations
-from this model result in a $(D RegionAllocatorError) being thrown.
+still-existing $(D RegionAllocator) instance using a given stack may be used to 
+allocate and free memory at any given time.  Deviations from this model result 
+in a $(D RegionAllocatorError) being thrown.
 
 An uninitialized $(D RegionAllocator) (for example $(D RegionAllocator.init))
 has semantics similar to a null pointer.  It may be assigned to or passed to
@@ -516,7 +157,7 @@ void foo() {
 void* bar(RegionAllocator alloc) {
     auto ret = alloc.allocate(42);
 
-    auto alloc2 = newRegionAllocator();
+    auto alloc2 = alloc.nested();
     auto ptr3 = alloc2.allocate(42);
 
     // ptr3 was allocated using alloc2, which is going out of scope.
@@ -532,12 +173,11 @@ void* bar(RegionAllocator alloc) {
 ---
 void* thisIsSafe() {
     // This is safe because the two RegionAllocator objects being used
-    // are using two different RegionAllocatorStack objects.
+    // are using two different stacks.
     auto alloc = newRegionAllocator();
     auto ptr1 = alloc.allocate(42);
 
-    auto stack = RegionAllocatorStack(1_048_576, GCScan.no);
-    auto alloc2 = stack.newRegionAllocator();
+    auto alloc2 = newRegionAllocator(1_048_576, GCScan.no);
 
     auto ptr2 = alloc2.allocate(42);
     auto ptr3 = alloc.allocate(42);
@@ -548,7 +188,7 @@ void* thisIsSafe() {
 void* dontDoThis() {
     auto alloc = newRegionAllocator();
     auto ptr1 = alloc.allocate(42);
-    auto alloc2 = newRegionAllocator();
+    auto alloc2 = alloc.nested();
 
     // Error:  Allocating from a RegionAllocator instance other than the
     // most recently created one that's still alive from a given stack.
@@ -573,13 +213,12 @@ void uninitialized() {
 
 Note:  Allocations larger than $(D this.segmentSize) are handled as a special
 case and fall back to allocating directly from the C heap.  These large
-allocations are freed as if they were allocated on a $(D RegionAllocatorStack)
-when $(D free) or $(D freeLast) is called or the last copy of a
-$(D RegionAllocator) instance goes out of scope.  However, due to the extra
-bookkeeping required, destroying a region (as happens when the last copy of
-a $(D RegionAllocator) instance goes out of scope) will require time linear
-instead of constant in the number of allocations for regions where these
-large allocations are present.
+allocations are freed as if they were allocated normally when $(D free) or 
+$(D freeLast) is called or the last copy of a $(D RegionAllocator) instance 
+goes out of scope.  However, due to the extra bookkeeping required, destroying 
+a region (as happens when the last copy of a $(D RegionAllocator) instance 
+goes out of scope) will require time linear instead of constant in the number 
+of allocations for regions where these large allocations are present.
 
 BUGS:  Finalizers/destuctors are never called on freeing objects allocated with
 $(D create), $(D newArray), $(D uninitializedArray) or $(D array),
@@ -820,19 +459,62 @@ public:
         this.correctRegionIndex = rhs.correctRegionIndex;
         if(initialized) incrementRefCount();
     }
+    
+    /**
+    Creates a new $(D RegionAllocator) instance using the same stack as
+    $(D this).  Memory can be allocated and freed from the returned
+    instance, but cannot be allocated and freed from $(D this) until the
+    last copy of the returned instance is destroyed.
+    
+    Examples:
+    ---
+    void fun() 
+    {
+        auto alloc = newRegionAllocator(1_024 * 1_024, GCScan.no);
+        auto ptr1 = alloc.allocate(42);
+        
+        foreach(i; 0..10)
+        {
+            auto alloc2 = alloc.nested();
+            auto ptr2 = alloc.allocate(42);   // Error.
+            auto ptr3 = alloc2.allocate(42);  // Works.
+            
+            // ptr3 is freed on exiting this scope, since the last copy
+            // of alloc2 is destroyed.
+        }
+        
+        auto ptr4 = alloc.allocate(42);  // Works.  alloc2 no longer exists.
+        
+        // ptr4 is freed on exiting this scope, since the last copy of
+        // alloc is destroyed.
+    }                
+    ---
+    */
+    RegionAllocator nested() 
+    {
+        if(!initialized)
+        {
+            throw new RegionAllocatorError(
+                "RegionAllocator instance not initialized.  Please use " ~
+                "newRegionAllocator() to create a RegionAllocator object.",
+                __FILE__,
+                __LINE__
+            );
+        }
+        
+        return stack.newRegionAllocator();
+    }    
 
     /**
-    Allocates $(D nBytes) bytes on the $(D RegionAllocatorStack) used by this
-    $(D RegionAllocator) instance.  The last block allocated from this
+    Allocates $(D nBytes) bytes.  The last block allocated from this
     $(D RegionAllocator) instance can be freed by calling
     $(D RegionAllocator.free) or $(D RegionAllocator.freeLast) or will be
     automatically freed when the last copy of this $(D RegionAllocator)
     instance goes out of scope.
 
     Allocation requests larger than $(D segmentSize) are
-    allocated directly on the C heap, are scanned by the GC iff
-    the $(D RegionAllocatorStack) instance that this object uses is scanned by
-    the GC, and are freed according to the same rules as described above.
+    allocated directly on the C heap, are scanned by the GC iff $(D gcScanned)
+    is true.
     */
     void* allocate(size_t nBytes)
     {
@@ -889,7 +571,7 @@ public:
     Frees the last block of memory allocated by the current
     $(D RegionAllocator).  Throws a $(D RegionAllocatorError) if
     this $(D RegionAllocator) is not the most recently created still-existing
-    $(D RegionAllocator) using its $(D RegionAllocatorStack) instance.
+    $(D RegionAllocator) on the stack it uses.
     */
     void freeLast()
     {
@@ -996,8 +678,8 @@ public:
     }
 
     /**
-    Returns whether the $(D RegionAllocatorStack) used by this
-    $(D RegionAllocator) instance is scanned by the garbage collector.
+    Returns whether the stack used by this $(D RegionAllocator) instance is 
+    scanned by the garbage collector.
     */
     bool gcScanned() @property const pure nothrow @safe
     {
@@ -1043,8 +725,7 @@ public:
     enum freeIsChecked = true;
 
     /**
-    Returns the segment size of the $(D RegionAllocatorStack) used by this
-    $(D RegionAllocator).
+    Returns the segment size of the stack used by this $(D RegionAllocator).
     */
     size_t segmentSize() @property
     {
@@ -1080,8 +761,8 @@ public:
         elements from being freed by the garbage collector.  A similar
         assumption cannot be made for ranges other than builtin arrays.
 
-    3.  The $(D RegionAllocatorStack) instance used by this
-        $(D RegionAllocator) is scanned by the garbage collector.
+    3.  The stack used by this $(D RegionAllocator) is scanned by the garbage 
+        collector.
 
     If none of these conditions is met, the array is returned on the C heap
     and $(D GC.addRange) is called.  In either case, $(D RegionAllocator.free),
@@ -1163,11 +844,161 @@ public:
 
 /**
 Returns a new $(D RegionAllocator) that uses the default thread-local
-$(D RegionAllocatorStack) instance.
+stack.  If this is called when a $(D RegionAllocator) using this stack
+is already in existence, the semantics will be identical to calling the
+$(D nested) method on the most recently created $(D RegionAllocator)
+instance using this stack.
+
+Examples:
+---
+
+void fun() 
+{
+    auto alloc = newRegionAllocator();
+    auto ptr1 = alloc.allocate(42);
+    fun2();
+    
+    // ptr1 freed on exit because last copy of alloc is going out of scope.
+}
+
+void fun2()
+{
+    auto alloc2 = newRegionAllocator();  // Same as calling alloc.nested().
+    auto ptr2 = alloc2.allocate(42);     // Works.
+    
+    // ptr2 freed on exit because last copy of alloc2 is going out of scope.
+}
+---    
 */
 RegionAllocator newRegionAllocator()
 {
     return RegionAllocator(getThreadLocal());
+}
+
+/**
+This flag determines whether a given $(D RegionAllocator) created using a
+new stack is scanned for pointers by the garbage collector (GC).  If yes, the 
+entire stack is scanned, not just the part currently in use, since there is 
+currently no efficient way to modify the bounds of a GC region.  The stack is 
+scanned conservatively, meaning that any bit pattern that would point to 
+GC-allocated memory if interpreted as a pointer is considered to be a pointer.  
+This can result in GC-allocated memory being retained when it should be freed.  
+Due to these caveats, it is recommended that any stack scanned by the GC be 
+small and/or short-lived.
+*/
+enum GCScan :
+bool
+{
+    ///
+    no = false,
+
+    ///
+    yes = true
+}
+
+/**
+Returns a new $(D RegionAllocator) that uses a newly created stack.  The
+underlying stack space is freed when the last $(D RegionAllocator) using
+this stack goes out of scope.
+
+Params:
+
+segmentSize = The size of each segment of the stack.
+
+shouldScan = Whether the stack should be scanned by the garbage collector.
+*/
+RegionAllocator newRegionAllocator(size_t segmentSize, GCScan shouldScan)
+{
+    auto stack = RegionAllocatorStack(segmentSize, shouldScan);
+    return stack.newRegionAllocator();
+}
+
+/**
+These properties get and set the segment size of the default thread-local
+stack.  The default size is 4 megabytes.  The setter is only effective before 
+the zero-argument overload of $(D newRegionAllocator) has been called for the 
+first time in the current thread.  Attempts to set this property after the 
+first call to this function from the current thread throw a 
+$(D RegionAllocatorError).
+*/
+size_t threadLocalSegmentSize() @property nothrow @safe
+{
+    return _threadLocalSegmentSize;
+}
+
+/// Ditto
+size_t threadLocalSegmentSize(size_t newSize) @property @safe
+{
+    if(threadLocalInitialized)
+    {
+        throw new RegionAllocatorError(
+            "Cannot set threadLocalSegmentSize after the thread-local " ~
+            "RegionAllocatorStack has been used for the first time.",
+            __FILE__,
+            __LINE__
+        );
+    }
+
+    return _threadLocalSegmentSize = newSize;
+}
+
+/**
+These properties determine whether the default thread-local
+stack is scanned by the garbage collector.  The default is no.  In most cases, 
+scanning a stack this long-lived is not recommended, as it will cause too many 
+false pointers.  (See $(D GCScan) for details.)
+
+The setter is only effective before the zero-argument overload of
+$(D newRegionAllocator) has been called for the first time in the current
+thread.  Attempts to set this property after the first call to this
+function from the current thread throw a $(D RegionAllocatorError).
+*/
+bool threadLocalStackIsScannable() @property nothrow @safe
+{
+    return _threadLocalStackIsScannable;
+}
+
+/// Ditto
+bool threadLocalStackIsScannable(bool shouldScan) @property @safe
+{
+    if(threadLocalInitialized)
+    {
+        throw new RegionAllocatorError(
+            "Cannot set threadLocalStackIsScannable after the thread-local " ~
+            "RegionAllocatorStack has been used for the first time.",
+            __FILE__,
+            __LINE__
+        );
+    }
+
+    return _threadLocalStackIsScannable = shouldScan;
+}
+
+private size_t _threadLocalSegmentSize = defaultSegmentSize;
+private RegionAllocatorStack threadLocalStack;
+private bool threadLocalInitialized;
+private bool _threadLocalStackIsScannable = false;
+
+// Ensures the thread-local stack is initialized, then returns it.
+private ref RegionAllocatorStack getThreadLocal()
+{
+    if(!threadLocalInitialized)
+    {
+        threadLocalInitialized = true;
+        threadLocalStack = RegionAllocatorStack(
+            threadLocalSegmentSize, cast(GCScan) threadLocalStackIsScannable
+        );
+    }
+
+    return threadLocalStack;
+}
+
+static ~this()
+{
+    if(threadLocalInitialized)
+    {
+        threadLocalStack.impl.refCountedPayload.destroy();
+    }
 }
 
 // Finishes copying a range to a C heap allocated array.  Assumes the first
@@ -1388,8 +1219,7 @@ unittest
 unittest
 {
     // Make sure the basics of using explicit stacks work.
-    auto stack = RegionAllocatorStack(4 * 1024 * 1024, GCScan.no);
-    auto alloc = stack.newRegionAllocator();
+    auto alloc = newRegionAllocator(4 * 1024 * 1024, GCScan.no);
     auto arr = alloc.array(iota(5));
     assert(arr == [0, 1, 2, 3, 4]);
     auto ptr = alloc.allocate(5);
@@ -1405,7 +1235,7 @@ unittest
     // If they don't then this will run out of memory.
     foreach(i; 0..100_000)
     {
-        auto stack = RegionAllocatorStack(4 * 1024 * 1024, GCScan.no);
+        auto alloc = newRegionAllocator(4 * 1024 * 1024, GCScan.no);
     }
 }
 
@@ -1466,15 +1296,262 @@ unittest
 }
 
 /**
-The exception that is thrown on invalid use of $(RegionAllocator) and
-$(D RegionAllocatorStack).  This exception is not thrown on out of memory.
-An $(D OutOfMemoryError) is thrown instead.
+The exception that is thrown on invalid use of $(RegionAllocator).  This 
+exception is not thrown on out of memory.  An $(D OutOfMemoryError) is thrown 
+instead.
 */
 class RegionAllocatorError : Error
 {
     this(string msg, string file, int line)
     {
         super(msg, file, line);
+    }
+}
+
+/*
+This object represents a segmented stack.  Memory can be allocated from this
+stack using a $(XREF regionallocator, RegionAllocator) object.  Multiple
+$(D RegionAllocator) objects may be created per
+$(D RegionAllocatorStack) but each $(D RegionAllocator) uses a single
+$(D RegionAllocatorStack).
+
+For most use cases it's convenient to use the default thread-local
+instance of $(D RegionAllocatorStack), which is lazily instantiated on
+the first call to the global function
+$(XREF regionallocator, newRegionAllocator).  Occasionally it may be useful
+to have multiple independent stacks in one thread, in which case a
+$(D RegionAllocatorStack) can be created manually.
+
+$(D RegionAllocatorStack) is reference counted and has reference semantics.
+When the last copy of a given instance goes out of scope, the memory
+held by the $(D RegionAllocatorStack) instance is released back to the
+heap.  This cannot happen before memory allocated to a $(D RegionAllocator)
+instance is released back to the stack, because a $(D RegionAllocator)
+holds a copy of the $(D RegionAllocatorStack) instance it uses.
+
+Examples:
+---
+import std.regionallocator;
+
+void main() {
+    fun1();
+}
+
+void fun1() {
+    auto stack = RegionAllocatorStack(1_048_576, GCScan.no);
+    fun2(stack);
+
+    // At the end of fun1, the last copy of the RegionAllocatorStack
+    // instance pointed to by stack goes out of scope.  The memory
+    // held by stack is released back to the heap.
+}
+
+void fun2(RegionAllocatorStack stack) {
+    auto alloc = stack.newRegionAllocator();
+    auto arr = alloc.newArray!(double[])(1_024);
+
+    // At the end of fun2, the last copy of the RegionAllocator instance
+    // pointed to by alloc goes out of scope.  The memory used by arr
+    // is released back to stack.
+}
+---
+*/
+private struct RegionAllocatorStack
+{
+private:
+    RefCounted!(RegionAllocatorStackImpl, RefCountedAutoInitialize.no) impl;
+    bool initialized;
+    bool _gcScanned;
+
+public:
+    /**
+    Create a new $(D RegionAllocatorStack) with a given segment size in bytes.
+    
+    Throws:  $(D RegionAllocatorError) when $(D segmentSize) is zero.
+    */
+    this(size_t segmentSize, GCScan shouldScan)
+    {
+        this._gcScanned = shouldScan;
+        if(segmentSize == 0)
+        {
+            throw new RegionAllocatorError(
+                "Cannot create a RegionAllocatorStack with segment size of 0.",
+                __FILE__, __LINE__
+            );
+        }
+
+        impl = typeof(impl)(segmentSize, shouldScan);
+        initialized = true;
+    }
+
+    /**
+    Creates a new $(D RegionAllocator) region using this stack.
+    */
+    RegionAllocator newRegionAllocator()
+    {
+        if(!initialized)
+        {
+            throw new RegionAllocatorError(
+                "Cannot create a RegionAllocator from an " ~
+                "uninitialized RegionAllocatorStack.  Did you call " ~
+                "RegionAllocatorStack's constructor?",
+                __FILE__,
+                __LINE__
+            );
+        }
+
+        return RegionAllocator(this);
+    }
+
+    /**
+    Whether this stack is scanned by the garbage collector.
+    */
+    bool gcScanned() @property const pure nothrow @safe
+    {
+        return _gcScanned;
+    }
+}
+
+private struct RegionAllocatorStackImpl
+{
+
+    this(size_t segmentSize, GCScan shouldScan)
+    {
+        this.segmentSize = segmentSize;
+        space = alignedMalloc(segmentSize, shouldScan);
+
+        // We don't need 16-byte alignment for the bookkeeping array.
+        immutable nBookKeep = segmentSize / alignBytes;
+        bookkeep = (cast(SizetPtr*) core.stdc.stdlib.malloc(nBookKeep))
+                   [0..nBookKeep / SizetPtr.sizeof];
+
+        if(!bookkeep.ptr)
+        {
+            outOfMemory();
+        }
+
+        nBlocks++;
+    }
+
+    size_t segmentSize;  // The size of each segment.
+
+    size_t used;
+    void* space;
+    size_t bookkeepIndex;
+    SizetPtr[] bookkeep;
+    uint nBlocks;
+    uint nFree;
+    size_t regionIndex = size_t.max;
+
+    // inUse holds info for all blocks except the one currently being
+    // allocated from.  freeList holds space ptrs for all free blocks.
+
+    static struct Block
+    {
+        size_t used = 0;
+        void* space = null;
+    }
+
+    SimpleStack!(Block) inUse;
+    SimpleStack!(void*) freeList;
+
+    void doubleSize(ref SizetPtr[] bookkeep)
+    {
+        size_t newSize = bookkeep.length * 2;
+        auto ptr = cast(SizetPtr*) core.stdc.stdlib.realloc(
+                       bookkeep.ptr, newSize * SizetPtr.sizeof);
+
+        if(!ptr)
+        {
+            outOfMemory();
+        }
+
+        bookkeep = ptr[0..newSize];
+    }
+
+    // Add an element to bookkeep, checking length first.
+    void putLast(void* last)
+    {
+        if (bookkeepIndex == bookkeep.length) doubleSize(bookkeep);
+        bookkeep[bookkeepIndex].p = last;
+        bookkeepIndex++;
+    }
+
+    void putLast(size_t num)
+    {
+        return putLast(cast(void*) num);
+    }
+
+    // The number of objects allocated on the C heap instead of here.
+    ref size_t nLargeObjects() @property pure nothrow
+    {
+        return bookkeep[regionIndex - 4].i;
+    }
+
+    // The number of extra segments that have been allocated in the current
+    // region beyond the base segment of the region.
+    ref size_t nExtraSegments() @property pure nothrow
+    {
+        return bookkeep[regionIndex - 3].i;
+    }
+
+    // Pushes a segment to the internal free list and frees segments to the
+    // heap if there are more than 2x as many segments on the free list as
+    // in use.
+    void freeSegment()
+    {
+        nExtraSegments--;
+        freeList.push(space);
+        auto newHead = inUse.pop();
+        space = newHead.space;
+        used = newHead.used;
+        nBlocks--;
+        nFree++;
+
+        if (nFree >= nBlocks * 2)
+        {
+            foreach(i; 0..nFree / 2)
+            {
+                alignedFree(freeList.pop);
+                nFree--;
+            }
+        }
+    }
+
+    void destroy()
+    {
+        if(space)
+        {
+            alignedFree(space);
+            space = null;
+        }
+
+        if(bookkeep)
+        {
+            core.stdc.stdlib.free(bookkeep.ptr);
+            bookkeep = null;
+        }
+
+        while(inUse.index > 0)
+        {
+            auto toFree = inUse.pop();
+            alignedFree(toFree.space);
+        }
+
+        inUse.destroy();
+
+        while(freeList.index > 0)
+        {
+            auto toFree = freeList.pop();
+            alignedFree(toFree);
+        }
+
+        freeList.destroy();
+    }
+
+    ~this()
+    {
+        destroy();
     }
 }
 
